@@ -64,6 +64,8 @@ import qualified Text.Parser.Combinators
 import qualified Text.Parser.Token
 import qualified Text.Parser.Token.Style
 
+import qualified Data.Attoparsec.Text.Lazy as Attoparsec
+
 -- | Source code extract
 data Src = Src Text.Megaparsec.SourcePos Text.Megaparsec.SourcePos Text
   deriving (Eq, Show)
@@ -86,7 +88,6 @@ newtype Parser a = Parser { unParser :: Text.Megaparsec.Parsec Void Text a }
     ,   Monad
     ,   Alternative
     ,   MonadPlus
-    ,   Text.Megaparsec.MonadParsec Void Text
     )
 
 instance Data.Semigroup.Semigroup a => Data.Semigroup.Semigroup (Parser a) where
@@ -103,32 +104,33 @@ instance IsString a => IsString (Parser a) where
     fromString x = fromString x <$ Text.Megaparsec.Char.string (fromString x)
 
 instance Text.Parser.Combinators.Parsing Parser where
-  try = Text.Megaparsec.try
+  try = Attoparsec.try
 
-  (<?>) = (Text.Megaparsec.<?>)
+  (<?>) = (Attoparsec.<?>)
 
-  skipMany = Text.Megaparsec.skipMany
+  skipMany = Attoparsec.skipMany
 
-  skipSome = Text.Megaparsec.skipSome
+  skipSome = Attoparsec.skipMany1
 
   unexpected = fail
 
-  eof = Parser Text.Megaparsec.eof
+  eof = Attoparsec.endOfInput
 
-  notFollowedBy = Text.Megaparsec.notFollowedBy
+  notFollowedBy = error "TODO"
+
 
 instance Text.Parser.Char.CharParsing Parser where
-  satisfy = Parser . Text.Megaparsec.Char.satisfy
+  satisfy = Parser . Attoparsec.satisfy
 
-  char = Text.Megaparsec.Char.char
+  char = Attoparsec.char
 
-  notChar = Text.Megaparsec.Char.char
+  notChar = Attoparsec.char
 
-  anyChar = Text.Megaparsec.Char.anyChar
+  anyChar = Attoparsec.anyChar
 
-  string = fmap Data.Text.Lazy.unpack . Text.Megaparsec.Char.string . fromString
+  string = Attoparsec.string
 
-  text = fmap Data.Text.Lazy.toStrict . Text.Megaparsec.Char.string . Data.Text.Lazy.fromStrict
+  text = Attoparsec.string
 
 instance TokenParsing Parser where
     someSpace =
