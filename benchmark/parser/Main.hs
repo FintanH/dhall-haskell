@@ -41,7 +41,7 @@ benchParser =
 
 benchExprFromText :: String -> TL.Text -> Criterion.Benchmark
 benchExprFromText name expr =
-    bench name $ whnf (Dhall.exprFromText "(input)") expr
+    bench name $ whnf Dhall.exprFromText expr
 
 main :: IO ()
 main = do
