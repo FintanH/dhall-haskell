@@ -65,29 +65,32 @@ import qualified Text.Parser.Token
 import qualified Text.Parser.Token.Style
 
 import qualified Data.Attoparsec.Text.Lazy as Attoparsec
+import Data.Attoparsec.Internal.Types (Pos)
 
 -- | Source code extract
-data Src = Src Text.Megaparsec.SourcePos Text.Megaparsec.SourcePos Text
+data Src = Src Pos Pos Text
   deriving (Eq, Show)
 
 instance Buildable Src where
     build (Src begin _ text) =
             build text <> "\n"
         <>  "\n"
-        <>  build (Text.Megaparsec.sourcePosPretty begin)
+        <>  build (Data.Text.Lazy.pack $ show begin)
         <>  "\n"
 
 {-| A `Parser` that is almost identical to
     @"Text.Megaparsec".`Text.Megaparsec.Parsec`@ except treating Haskell-style
     comments as whitespace
 -}
-newtype Parser a = Parser { unParser :: Text.Megaparsec.Parsec Void Text a }
+newtype Parser a = Parser { unParser :: Attoparsec.Parser a }
     deriving
     (   Functor
     ,   Applicative
     ,   Monad
     ,   Alternative
     ,   MonadPlus
+    ,   Text.Parser.Combinators.Parsing
+    ,   Text.Parser.Char.CharParsing
     )
 
 instance Data.Semigroup.Semigroup a => Data.Semigroup.Semigroup (Parser a) where
@@ -101,24 +104,9 @@ instance (Data.Semigroup.Semigroup a, Monoid a) => Monoid (Parser a) where
 #endif
 
 instance IsString a => IsString (Parser a) where
-    fromString x = fromString x <$ Text.Megaparsec.Char.string (fromString x)
+    fromString x = Parser (fromString x <$ Attoparsec.string (fromString x))
 
-instance Text.Parser.Combinators.Parsing Parser where
-  try = Attoparsec.try
-
-  (<?>) = (Attoparsec.<?>)
-
-  skipMany = Attoparsec.skipMany
-
-  skipSome = Attoparsec.skipMany1
-
-  unexpected = fail
-
-  eof = Attoparsec.endOfInput
-
-  notFollowedBy = error "TODO"
-
-
+{--
 instance Text.Parser.Char.CharParsing Parser where
   satisfy = Parser . Attoparsec.satisfy
 
@@ -131,23 +119,24 @@ instance Text.Parser.Char.CharParsing Parser where
   string = Attoparsec.string
 
   text = Attoparsec.string
-
+--}
+--
 instance TokenParsing Parser where
     someSpace =
         Text.Parser.Token.Style.buildSomeSpaceParser
-            (Parser (Text.Megaparsec.skipSome (Text.Megaparsec.Char.satisfy Data.Char.isSpace)))
+            (Parser (Text.Parser.Combinators.skipSome (Attoparsec.satisfy Data.Char.isSpace)))
             Text.Parser.Token.Style.haskellCommentStyle
 
     highlight _ = id
 
-    semi = token (Text.Megaparsec.Char.char ';' <?> ";")
+    semi = token (Text.Parser.Char.char ';' <?> ";")
 
 noted :: Parser (Expr Src a) -> Parser (Expr Src a)
 noted parser = do
-    before      <- Text.Megaparsec.getPosition
-    (tokens, e) <- Text.Megaparsec.match parser
-    after       <- Text.Megaparsec.getPosition
-    return (Note (Src before after tokens) e)
+    before      <- pure 0 -- Text.Megaparsec.getPosition
+    (tokens, e) <- Parser $ Attoparsec.match (unParser parser)
+    after       <- pure 1 -- Text.Megaparsec.getPosition
+    return (Note (Src before after (Data.Text.Lazy.fromStrict tokens)) e)
 
 count :: (Semigroup a, Monoid a) => Int -> Parser a -> Parser a
 count n parser = mconcat (replicate n parser)
@@ -229,6 +218,9 @@ whitespaceChunk =
 
 whitespace :: Parser ()
 whitespace = Text.Parser.Combinators.skipMany whitespaceChunk
+
+match :: Parser a -> Parser (Data.Text.Text, a)
+match (Parser p) = Parser $ Attoparsec.match p
 
 alpha :: Char -> Bool
 alpha c = ('\x41' <= c && c <= '\x5A') || ('\x61' <= c && c <= '\x7A')
@@ -1614,8 +1606,8 @@ instance Show ParseError where
 instance Exception ParseError
 
 -- | Parse an expression from `Text` containing a Dhall program
-exprFromText :: String -> Text -> Either ParseError (Expr Src Import)
-exprFromText delta text = fmap snd (exprAndHeaderFromText delta text)
+exprFromText :: Text -> Either ParseError (Expr Src Import)
+exprFromText text = fmap snd (exprAndHeaderFromText text)
 
 {-| Like `exprFromText` but also returns the leading comments and whitespace
     (i.e. header) up to the last newline before the code begins
@@ -1630,17 +1622,18 @@ exprFromText delta text = fmap snd (exprAndHeaderFromText delta text)
     This is used by @dhall-format@ to preserve leading comments and whitespace
 -}
 exprAndHeaderFromText
-    :: String
-    -> Text
+    :: Text
     -> Either ParseError (Text, Expr Src Import)
-exprAndHeaderFromText delta text = case result of
-    Left errInfo   -> Left (ParseError { unwrap = errInfo, input = text })
-    Right (txt, r) -> Right (Data.Text.Lazy.dropWhileEnd (/= '\n') txt, r)
+exprAndHeaderFromText text = case result of
+    Attoparsec.Fail _ _ _ -> error "TODO: Fail"
+    Attoparsec.Done _ (txt, r) -> Right (Data.Text.Lazy.dropWhileEnd (/= '\n') txt, r)
+    -- Left errInfo   -> Left (ParseError { unwrap = errInfo, input = text })
   where
+    parser :: Parser (Text, Expr Src Import)
     parser = do
-        (bytes, _) <- Text.Megaparsec.match whitespace
+        (bytes, _) <- match whitespace
         r <- expr
-        Text.Megaparsec.eof
-        return (bytes, r)
+        Text.Parser.Combinators.eof
+        return (Data.Text.Lazy.fromStrict bytes, r)
 
-    result = Text.Megaparsec.parse (unParser parser) delta text
+    result = Attoparsec.parse (unParser parser) text

@@ -74,7 +74,7 @@ parseAndLoad
   => String -> m ( Dhall.Expr Dhall.Src Dhall.X )
 parseAndLoad src = do
   parsed <-
-    case Dhall.exprFromText "(stdin)" ( LazyText.pack src ) of
+    case Dhall.exprFromText ( LazyText.pack src ) of
       Left e ->
         liftIO ( throwIO e )
 

@@ -98,7 +98,7 @@ getExpression :: IO (Expr Src Import)
 getExpression = do
     inText <- Data.Text.Lazy.IO.getContents
 
-    throws (Dhall.Parser.exprFromText "(stdin)" inText)
+    throws (Dhall.Parser.exprFromText inText)
 
 assertNoImports :: Expr Src Import -> IO (Expr Src X)
 assertNoImports expression =
