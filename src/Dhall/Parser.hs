@@ -801,10 +801,15 @@ localRaw =
         ]
   where
     parentPath = do
+<<<<<<< HEAD
         _    <- ".." :: Parser Text
-        file <- file_
+        File (Directory segments) <- file_
+=======
+        _    <- ".." :: Parser Builder
+        File (Directory segments) final <- file_
+>>>>>>> dev/benchmark
 
-        return (Local Parent file)
+        return (Local Here (File (Directory (segments ++ [".."])) final))
 
     herePath = do
         _    <- "." :: Parser Text
