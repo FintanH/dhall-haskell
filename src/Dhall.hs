@@ -106,7 +106,7 @@ import qualified Data.Functor.Compose
 import qualified Data.Functor.Product
 import qualified Data.HashMap.Strict.InsOrd
 import qualified Data.Scientific
-import qualified Data.Sequence
+-- import qualified Data.Sequence
 import qualified Data.Set
 import qualified Data.Text
 import qualified Data.Text.IO
@@ -634,7 +634,7 @@ maybe (Type extractIn expectedIn) = Type extractOut expectedOut
 >>> input (sequence natural) "[1, 2, 3]"
 fromList [1,2,3]
 -}
-sequence :: Type a -> Type (Seq a)
+sequence :: Type a -> Type (Vector a)
 sequence (Type extractIn expectedIn) = Type extractOut expectedOut
   where
     extractOut (ListLit _ es) = traverse extractIn es
@@ -745,8 +745,10 @@ instance Interpret Text where
 instance Interpret a => Interpret (Maybe a) where
     autoWith opts = maybe (autoWith opts)
 
+{--
 instance Interpret a => Interpret (Seq a) where
     autoWith opts = sequence (autoWith opts)
+--}
 
 instance Interpret a => Interpret [a] where
     autoWith = fmap (fmap Data.Vector.toList) autoWith
@@ -1092,6 +1094,7 @@ instance Inject a => Inject (Maybe a) where
 
         declaredOut = App Optional declaredIn
 
+{--
 instance Inject a => Inject (Seq a) where
     injectWith options = InputType embedOut declaredOut
       where
@@ -1100,12 +1103,19 @@ instance Inject a => Inject (Seq a) where
         declaredOut = App List declaredIn
 
         InputType embedIn declaredIn = injectWith options
+--}
 
 instance Inject a => Inject [a] where
-    injectWith = fmap (contramap Data.Sequence.fromList) injectWith
+    injectWith = fmap (contramap Data.Vector.fromList) injectWith
 
 instance Inject a => Inject (Vector a) where
-    injectWith = fmap (contramap Data.Vector.toList) injectWith
+    injectWith options = InputType embedOut declaredOut
+      where
+        embedOut xs = ListLit (Just declaredIn) (fmap embedIn xs)
+
+        declaredOut = App List declaredIn
+
+        InputType embedIn declaredIn = injectWith options
 
 instance Inject a => Inject (Data.Set.Set a) where
     injectWith = fmap (contramap Data.Set.toList) injectWith

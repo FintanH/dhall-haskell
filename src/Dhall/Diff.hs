@@ -22,11 +22,11 @@ import Data.List.NonEmpty (NonEmpty(..))
 import Data.Monoid (Any(..))
 import Data.Scientific (Scientific)
 import Data.Semigroup
-import Data.Sequence (Seq)
 import Data.Set (Set)
 import Data.String (IsString(..))
 import Data.Text (Text)
 import Data.Text.Prettyprint.Doc (Doc, Pretty)
+import Data.Vector (Vector)
 import Dhall.Core (Chunks (..), Const(..), Expr(..), Var(..))
 import Dhall.Pretty.Internal (Ann)
 import Numeric.Natural (Natural)
@@ -355,7 +355,7 @@ diffChunks cL cR
 
 diffList
     :: (Eq a, Pretty a)
-    => Seq (Expr s a) -> Seq (Expr s a) -> Diff
+    => Vector (Expr s a) -> Vector (Expr s a) -> Diff
 diffList l r
   | allDifferent parts = difference listSkeleton listSkeleton
   | otherwise          = bracketed (foldMap diffPart parts)

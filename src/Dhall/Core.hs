@@ -68,11 +68,11 @@ import Data.HashSet (HashSet)
 import Data.String (IsString(..))
 import Data.Scientific (Scientific)
 import Data.Semigroup (Semigroup(..))
-import Data.Sequence (Seq, ViewL(..), ViewR(..))
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Text.Prettyprint.Doc (Pretty)
 import Data.Traversable
+import Data.Vector (Vector)
 import {-# SOURCE #-} Dhall.Pretty.Internal
 import Numeric.Natural (Natural)
 import Prelude hiding (succ)
@@ -81,10 +81,10 @@ import qualified Control.Monad
 import qualified Crypto.Hash
 import qualified Data.HashMap.Strict.InsOrd
 import qualified Data.HashSet
-import qualified Data.Sequence
 import qualified Data.Set
 import qualified Data.Text
 import qualified Data.Text.Prettyprint.Doc  as Pretty
+import qualified Data.Vector
 
 {-| Constants for a pure type system
 
@@ -355,7 +355,7 @@ data Expr s a
     | List
     -- | > ListLit (Just t ) [x, y, z]              ~  [x, y, z] : List t
     --   > ListLit  Nothing  [x, y, z]              ~  [x, y, z]
-    | ListLit (Maybe (Expr s a)) (Seq (Expr s a))
+    | ListLit (Maybe (Expr s a)) (Vector (Expr s a))
     -- | > ListAppend x y                           ~  x # y
     | ListAppend (Expr s a) (Expr s a)
     -- | > ListBuild                                ~  List/build
@@ -1452,20 +1452,12 @@ normalizeWith ctx e0 = loop (denote e0)
                 strictCons y ys = loop (App (App cons y) ys)
                 lazyCons   y ys =       App (App cons y) ys
             App (App ListLength _) (ListLit _ ys) ->
-                NaturalLit (fromIntegral (Data.Sequence.length ys))
-            App (App ListHead t) (ListLit _ ys) -> loop (OptionalLit t m)
-              where
-                m = case Data.Sequence.viewl ys of
-                        y :< _ -> Just y
-                        _      -> Nothing
-            App (App ListLast t) (ListLit _ ys) -> loop (OptionalLit t m)
-              where
-                m = case Data.Sequence.viewr ys of
-                        _ :> y -> Just y
-                        _      -> Nothing
+                NaturalLit (fromIntegral (Data.Vector.length ys))
+            App (App ListHead t) (ListLit _ ys) -> loop (OptionalLit t $ Data.Vector.headM ys)
+            App (App ListLast t) (ListLit _ ys) -> loop (OptionalLit t $ Data.Vector.lastM ys)
             App (App ListIndexed _A₀) (ListLit _A₁ as₀) -> loop (ListLit t as₁)
               where
-                as₁ = Data.Sequence.mapWithIndex adapt as₀
+                as₁ = Data.Vector.imap adapt as₀
 
                 _A₂ = Record (Data.HashMap.Strict.InsOrd.fromList kts)
                   where
@@ -1483,9 +1475,9 @@ normalizeWith ctx e0 = loop (denote e0)
                           , ("value", a_)
                           ]
             App (App ListReverse t) (ListLit _ xs) ->
-                loop (ListLit m (Data.Sequence.reverse xs))
+                loop (ListLit m (Data.Vector.reverse xs))
               where
-                m = if Data.Sequence.null xs then Just t else Nothing
+                m = if Data.Vector.null xs then Just t else Nothing
             App (App (App (App (App OptionalFold _) (OptionalLit _ xs)) _) just) nothing ->
                 loop (maybe nothing just' xs)
               where
@@ -1600,8 +1592,8 @@ normalizeWith ctx e0 = loop (denote e0)
         es' = fmap loop es
     ListAppend x y -> decide (loop x) (loop y)
       where
-        decide (ListLit _ m)  r            | Data.Sequence.null m = r
-        decide  l            (ListLit _ n) | Data.Sequence.null n = l
+        decide (ListLit _ m)  r            | Data.Vector.null m = r
+        decide  l            (ListLit _ n) | Data.Vector.null n = l
         decide (ListLit t m) (ListLit _ n)                        = ListLit t (m <> n)
         decide  l             r                                   = ListAppend l r
     ListBuild -> ListBuild

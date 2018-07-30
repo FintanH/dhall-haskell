@@ -17,7 +17,7 @@ import qualified Data.ByteArray.Encoding
 import qualified Data.ByteString
 import qualified Data.Char
 import qualified Data.HashMap.Strict.InsOrd
-import qualified Data.Sequence
+import qualified Data.Vector
 import qualified Data.Text
 import qualified Data.Text.Encoding
 import qualified Text.Megaparsec
@@ -695,7 +695,7 @@ nonEmptyListLiteral embedded = (do
     a <- expression embedded
     b <- Text.Megaparsec.many (do _comma; expression embedded)
     _closeBracket
-    return (ListLit Nothing (Data.Sequence.fromList (a:b))) ) <?> "list literal"
+    return (ListLit Nothing (Data.Vector.fromList (a:b))) ) <?> "list literal"
 
 completeExpression :: Parser a -> Parser (Expr Src a)
 completeExpression embedded = do

@@ -25,12 +25,12 @@ import Control.Exception (Exception)
 import Data.Data (Data(..))
 import Data.Foldable (forM_, toList)
 import Data.Monoid ((<>))
-import Data.Sequence (Seq, ViewL(..))
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Text.Prettyprint.Doc (Doc, Pretty(..))
 import Data.Traversable (forM)
 import Data.Typeable (Typeable)
+import Data.Vector (Vector)
 import Dhall.Core (Const(..), Chunks(..), Expr(..), Var(..))
 import Dhall.Context (Context)
 import Dhall.Pretty (Ann, layoutOpts)
@@ -38,19 +38,19 @@ import Dhall.Pretty (Ann, layoutOpts)
 import qualified Data.Foldable
 import qualified Data.HashMap.Strict
 import qualified Data.HashMap.Strict.InsOrd
-import qualified Data.Sequence
 import qualified Data.Set
 import qualified Data.Text                               as Text
 import qualified Data.Text.Prettyprint.Doc               as Pretty
 import qualified Data.Text.Prettyprint.Doc.Render.String as Pretty
+import qualified Data.Vector
 import qualified Dhall.Context
 import qualified Dhall.Core
 import qualified Dhall.Diff
 import qualified Dhall.Pretty.Internal
 
-traverseWithIndex_ :: Applicative f => (Int -> a -> f b) -> Seq a -> f ()
+traverseWithIndex_ :: Applicative f => (Int -> a -> f b) -> Vector a -> f ()
 traverseWithIndex_ k xs =
-    Data.Foldable.sequenceA_ (Data.Sequence.mapWithIndex k xs)
+    Data.Foldable.sequenceA_ (Data.Vector.imap k xs)
 
 axiom :: Const -> Either (TypeError s a) Const
 axiom Type = return Kind
@@ -353,8 +353,8 @@ typeWithA tpa = loop
     loop _      List              = do
         return (Pi "_" (Const Type) (Const Type))
     loop ctx e@(ListLit  Nothing  xs) = do
-        case Data.Sequence.viewl xs of
-            x0 :< _ -> do
+        case Data.Vector.headM xs of
+            Just x0 -> do
                 t <- loop ctx x0
                 s <- fmap Dhall.Core.normalize (loop ctx t)
                 case s of
