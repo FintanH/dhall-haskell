@@ -8,7 +8,7 @@ module Dhall.Parser.Combinators where
 import           Control.Applicative        (Alternative (..), liftA2)
 import           Control.Monad              (MonadPlus (..))
 import           Data.Data                  (Data)
-import           Data.HashMap.Strict.InsOrd (InsOrdHashMap)
+import           Data.HashMap.Strict        (HashMap)
 import           Data.Semigroup             (Semigroup (..))
 import           Data.Sequence              (ViewL (..))
 import           Data.Set                   (Set)
@@ -21,7 +21,7 @@ import           Text.Parser.Combinators    (try, (<?>))
 import           Text.Parser.Token          (TokenParsing (..))
 
 import qualified Data.Char
-import qualified Data.HashMap.Strict.InsOrd
+import qualified Data.HashMap.Strict
 import qualified Data.List
 import qualified Data.Sequence
 import qualified Data.Set
@@ -246,7 +246,7 @@ noDuplicates = go Data.Set.empty
         then fail "Duplicate key"
         else go (Data.Set.insert x found) xs
 
-toMap :: [(Text, a)] -> Parser (InsOrdHashMap Text a)
+toMap :: [(Text, a)] -> Parser (HashMap Text a)
 toMap kvs = do
     let adapt (k, v) = (k, pure v)
     let m = fromListWith (<|>) (fmap adapt kvs)
@@ -258,10 +258,10 @@ toMap kvs = do
                 else
                     Text.Parser.Combinators.unexpected
                         ("duplicate field: " ++ Data.Text.unpack k)
-    Data.HashMap.Strict.InsOrd.traverseWithKey action m
+    Data.HashMap.Strict.traverseWithKey action m
   where
     fromListWith combine = Data.List.foldl' snoc nil
       where
-        nil = Data.HashMap.Strict.InsOrd.empty
+        nil = Data.HashMap.Strict.empty
 
-        snoc m (k, v) = Data.HashMap.Strict.InsOrd.insertWith combine k v m
+        snoc m (k, v) = Data.HashMap.Strict.insertWith combine k v m

@@ -6,7 +6,7 @@
 module Regression where
 
 import qualified Control.Exception
-import qualified Data.HashMap.Strict.InsOrd
+import qualified Data.HashMap.Strict
 import qualified Data.Text.Lazy.IO
 import qualified Data.Text.Prettyprint.Doc
 import qualified Data.Text.Prettyprint.Doc.Render.Text
@@ -54,12 +54,12 @@ unnamedFields :: TestTree
 unnamedFields = Test.Tasty.HUnit.testCase "Unnamed Fields" (do
     let ty = Dhall.auto @Foo
     Test.Tasty.HUnit.assertEqual "Good type" (Dhall.expected ty) (Dhall.Core.Union (
-            Data.HashMap.Strict.InsOrd.fromList [
-                ("Bar",Dhall.Core.Record (Data.HashMap.Strict.InsOrd.fromList [
+            Data.HashMap.Strict.fromList [
+                ("Bar",Dhall.Core.Record (Data.HashMap.Strict.fromList [
                     ("_1",Dhall.Core.Bool),("_2",Dhall.Core.Bool),("_3",Dhall.Core.Bool)]))
-                , ("Baz",Dhall.Core.Record (Data.HashMap.Strict.InsOrd.fromList [
+                , ("Baz",Dhall.Core.Record (Data.HashMap.Strict.fromList [
                     ("_1",Dhall.Core.Integer),("_2",Dhall.Core.Integer)]))
-                ,("Foo",Dhall.Core.Record (Data.HashMap.Strict.InsOrd.fromList [
+                ,("Foo",Dhall.Core.Record (Data.HashMap.Strict.fromList [
                     ("_1",Dhall.Core.Integer),("_2",Dhall.Core.Bool)]))]))
 
     let inj = Dhall.inject @Foo
@@ -67,7 +67,7 @@ unnamedFields = Test.Tasty.HUnit.testCase "Unnamed Fields" (do
 
     let tu_ty = Dhall.auto @(Integer, Bool)
     Test.Tasty.HUnit.assertEqual "Auto Tuple" (Dhall.expected tu_ty) (Dhall.Core.Record (
-            Data.HashMap.Strict.InsOrd.fromList [ ("_1",Dhall.Core.Integer),("_2",Dhall.Core.Bool) ]))
+            Data.HashMap.Strict.fromList [ ("_1",Dhall.Core.Integer),("_2",Dhall.Core.Bool) ]))
 
     let tu_in = Dhall.inject @(Integer, Bool)
     Test.Tasty.HUnit.assertEqual "Inj. Tuple" (Dhall.declared tu_in) (Dhall.expected tu_ty)
