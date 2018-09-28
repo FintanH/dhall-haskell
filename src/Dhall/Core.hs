@@ -65,7 +65,7 @@ import Data.Bifunctor (Bifunctor(..))
 import Data.Data (Data)
 import Data.Foldable
 import Data.Hashable (Hashable)
-import Data.HashMap.Strict.InsOrd (InsOrdHashMap)
+import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
 import Data.String (IsString(..))
 import Data.Scientific (Scientific)
@@ -83,7 +83,7 @@ import Prelude hiding (succ)
 import qualified Control.Monad
 import qualified Crypto.Hash
 import qualified Data.List
-import qualified Data.HashMap.Strict.InsOrd
+import qualified Data.HashMap.Strict
 import qualified Data.HashSet
 import qualified Data.Ord
 import qualified Data.Sequence
@@ -417,13 +417,13 @@ data Expr s a
     -- | > OptionalBuild                            ~  Optional/build
     | OptionalBuild
     -- | > Record       [(k1, t1), (k2, t2)]        ~  { k1 : t1, k2 : t1 }
-    | Record    (InsOrdHashMap Text (Expr s a))
+    | Record    (HashMap Text (Expr s a))
     -- | > RecordLit    [(k1, v1), (k2, v2)]        ~  { k1 = v1, k2 = v2 }
-    | RecordLit (InsOrdHashMap Text (Expr s a))
+    | RecordLit (HashMap Text (Expr s a))
     -- | > Union        [(k1, t1), (k2, t2)]        ~  < k1 : t1 | k2 : t2 >
-    | Union     (InsOrdHashMap Text (Expr s a))
+    | Union     (HashMap Text (Expr s a))
     -- | > UnionLit k v [(k1, t1), (k2, t2)]        ~  < k = v | k1 : t1 | k2 : t2 >
-    | UnionLit Text (Expr s a) (InsOrdHashMap Text (Expr s a))
+    | UnionLit Text (Expr s a) (HashMap Text (Expr s a))
     -- | > Combine x y                              ~  x ∧ y
     | Combine (Expr s a) (Expr s a)
     -- | > CombineTypes x y                         ~  x ⩓ y
@@ -1396,12 +1396,6 @@ denote (Project a b         ) = Project (denote a) b
 denote (ImportAlt a b       ) = ImportAlt (denote a) (denote b)
 denote (Embed a             ) = Embed a
 
-sortMap :: (Ord k, Hashable k) => InsOrdHashMap k v -> InsOrdHashMap k v
-sortMap =
-      Data.HashMap.Strict.InsOrd.fromList
-    . Data.List.sortBy (Data.Ord.comparing fst)
-    . Data.HashMap.Strict.InsOrd.toList
-
 {-| Reduce an expression to its normal form, performing beta reduction and applying
     any custom definitions.
 
@@ -1524,7 +1518,7 @@ normalizeWith ctx e0 = loop (denote e0)
               where
                 as₁ = Data.Sequence.mapWithIndex adapt as₀
 
-                _A₂ = Record (Data.HashMap.Strict.InsOrd.fromList kts)
+                _A₂ = Record (Data.HashMap.Strict.fromList kts)
                   where
                     kts = [ ("index", Natural)
                           , ("value", _A₀)
@@ -1534,7 +1528,7 @@ normalizeWith ctx e0 = loop (denote e0)
                   | otherwise = Nothing
 
                 adapt n a_ =
-                    RecordLit (Data.HashMap.Strict.InsOrd.fromList kvs)
+                    RecordLit (Data.HashMap.Strict.fromList kvs)
                   where
                     kvs = [ ("index", NaturalLit (fromIntegral n))
                           , ("value", a_)
@@ -1677,48 +1671,48 @@ normalizeWith ctx e0 = loop (denote e0)
     None -> None
     OptionalFold -> OptionalFold
     OptionalBuild -> OptionalBuild
-    Record kts -> Record (sortMap kts')
+    Record kts -> Record kts'
       where
         kts' = fmap loop kts
-    RecordLit kvs -> RecordLit (sortMap kvs')
+    RecordLit kvs -> RecordLit kvs'
       where
         kvs' = fmap loop kvs
-    Union kts -> Union (sortMap kts')
+    Union kts -> Union kts'
       where
         kts' = fmap loop kts
-    UnionLit k v kvs -> UnionLit k v' (sortMap kvs')
+    UnionLit k v kvs -> UnionLit k v' kvs'
       where
         v'   =      loop v
         kvs' = fmap loop kvs
     Combine x y -> decide (loop x) (loop y)
       where
-        decide (RecordLit m) r | Data.HashMap.Strict.InsOrd.null m =
+        decide (RecordLit m) r | Data.HashMap.Strict.null m =
             r
-        decide l (RecordLit n) | Data.HashMap.Strict.InsOrd.null n =
+        decide l (RecordLit n) | Data.HashMap.Strict.null n =
             l
         decide (RecordLit m) (RecordLit n) =
-            RecordLit (sortMap (Data.HashMap.Strict.InsOrd.unionWith decide m n))
+            RecordLit (Data.HashMap.Strict.unionWith decide m n)
         decide l r =
             Combine l r
     CombineTypes x y -> decide (loop x) (loop y)
       where
-        decide (Record m) r | Data.HashMap.Strict.InsOrd.null m =
+        decide (Record m) r | Data.HashMap.Strict.null m =
             r
-        decide l (Record n) | Data.HashMap.Strict.InsOrd.null n =
+        decide l (Record n) | Data.HashMap.Strict.null n =
             l
         decide (Record m) (Record n) =
-            Record (sortMap (Data.HashMap.Strict.InsOrd.unionWith decide m n))
+            Record (Data.HashMap.Strict.unionWith decide m n)
         decide l r =
             CombineTypes l r
 
     Prefer x y -> decide (loop x) (loop y)
       where
-        decide (RecordLit m) r | Data.HashMap.Strict.InsOrd.null m =
+        decide (RecordLit m) r | Data.HashMap.Strict.null m =
             r
-        decide l (RecordLit n) | Data.HashMap.Strict.InsOrd.null n =
+        decide l (RecordLit n) | Data.HashMap.Strict.null n =
             l
         decide (RecordLit m) (RecordLit n) =
-            RecordLit (sortMap (Data.HashMap.Strict.InsOrd.union n m))
+            RecordLit (Data.HashMap.Strict.union n m)
         decide l r =
             Prefer l r
     Merge x y t      ->
@@ -1726,7 +1720,7 @@ normalizeWith ctx e0 = loop (denote e0)
             RecordLit kvsX ->
                 case y' of
                     UnionLit kY vY _ ->
-                        case Data.HashMap.Strict.InsOrd.lookup kY kvsX of
+                        case Data.HashMap.Strict.lookup kY kvsX of
                             Just vX -> loop (App vX vY)
                             Nothing -> Merge x' y' t'
                     _ -> Merge x' y' t'
@@ -1739,18 +1733,18 @@ normalizeWith ctx e0 = loop (denote e0)
         case t' of
             Union kts -> RecordLit kvs
               where
-                kvs = Data.HashMap.Strict.InsOrd.mapWithKey adapt kts
+                kvs = Data.HashMap.Strict.mapWithKey adapt kts
 
                 adapt k t_ = Lam k t_ (UnionLit k (Var (V k 0)) rest)
                   where
-                    rest = Data.HashMap.Strict.InsOrd.delete k kts
+                    rest = Data.HashMap.Strict.delete k kts
             _ -> Constructors t'
       where
         t' = loop t
     Field r x        ->
         case loop r of
             RecordLit kvs ->
-                case Data.HashMap.Strict.InsOrd.lookup x kvs of
+                case Data.HashMap.Strict.lookup x kvs of
                     Just v  -> loop v
                     Nothing -> Field (RecordLit (fmap loop kvs)) x
             r' -> Field r' x
@@ -1761,12 +1755,12 @@ normalizeWith ctx e0 = loop (denote e0)
                     Just s  ->
                         loop (RecordLit kvs')
                       where
-                        kvs' = Data.HashMap.Strict.InsOrd.fromList s
+                        kvs' = Data.HashMap.Strict.fromList s
                     Nothing ->
                         Project (RecordLit (fmap loop kvs)) xs
               where
                 adapt x = do
-                    v <- Data.HashMap.Strict.InsOrd.lookup x kvs
+                    v <- Data.HashMap.Strict.lookup x kvs
                     return (x, v)
             r' -> Project r' xs
     Note _ e' -> loop e'
@@ -1947,20 +1941,20 @@ isNormalized e0 = loop (denote e0)
       UnionLit _ v kvs -> loop v && all loop kvs
       Combine x y -> loop x && loop y && decide x y
         where
-          decide (RecordLit m) _ | Data.HashMap.Strict.InsOrd.null m = False
-          decide _ (RecordLit n) | Data.HashMap.Strict.InsOrd.null n = False
+          decide (RecordLit m) _ | Data.HashMap.Strict.null m = False
+          decide _ (RecordLit n) | Data.HashMap.Strict.null n = False
           decide (RecordLit _) (RecordLit _) = False
           decide  _ _ = True
       CombineTypes x y -> loop x && loop y && decide x y
         where
-          decide (Record m) _ | Data.HashMap.Strict.InsOrd.null m = False
-          decide _ (Record n) | Data.HashMap.Strict.InsOrd.null n = False
+          decide (Record m) _ | Data.HashMap.Strict.null m = False
+          decide _ (Record n) | Data.HashMap.Strict.null n = False
           decide (Record _) (Record _) = False
           decide  _ _ = True
       Prefer x y -> loop x && loop y && decide x y
         where
-          decide (RecordLit m) _ | Data.HashMap.Strict.InsOrd.null m = False
-          decide _ (RecordLit n) | Data.HashMap.Strict.InsOrd.null n = False
+          decide (RecordLit m) _ | Data.HashMap.Strict.null m = False
+          decide _ (RecordLit n) | Data.HashMap.Strict.null n = False
           decide (RecordLit _) (RecordLit _) = False
           decide  _ _ = True
       Merge x y t -> loop x && loop y && all loop t &&
@@ -1968,7 +1962,7 @@ isNormalized e0 = loop (denote e0)
               RecordLit kvsX ->
                   case y of
                       UnionLit kY _  _ ->
-                          case Data.HashMap.Strict.InsOrd.lookup kY kvsX of
+                          case Data.HashMap.Strict.lookup kY kvsX of
                               Just _  -> False
                               Nothing -> True
                       _ -> True
@@ -1981,14 +1975,14 @@ isNormalized e0 = loop (denote e0)
       Field r x -> loop r &&
           case r of
               RecordLit kvs ->
-                  case Data.HashMap.Strict.InsOrd.lookup x kvs of
+                  case Data.HashMap.Strict.lookup x kvs of
                       Just _  -> False
                       Nothing -> True
               _ -> True
       Project r xs -> loop r &&
           case r of
               RecordLit kvs ->
-                  if all (flip Data.HashMap.Strict.InsOrd.member kvs) xs
+                  if all (flip Data.HashMap.Strict.member kvs) xs
                       then False
                       else True
               _ -> True

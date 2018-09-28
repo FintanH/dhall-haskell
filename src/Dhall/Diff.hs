@@ -17,7 +17,7 @@ module Dhall.Diff (
 
 import Data.Foldable (fold, toList)
 import Data.Function (on)
-import Data.HashMap.Strict.InsOrd (InsOrdHashMap)
+import Data.HashMap.Strict (HashMap)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Monoid (Any(..))
 import Data.Scientific (Scientific)
@@ -32,7 +32,7 @@ import Dhall.Pretty.Internal (Ann)
 import Numeric.Natural (Natural)
 
 import qualified Data.Algorithm.Diff        as Algo.Diff
-import qualified Data.HashMap.Strict.InsOrd as HashMap
+import qualified Data.HashMap.Strict        as HashMap
 import qualified Data.List.NonEmpty
 import qualified Data.Set
 import qualified Data.Text
@@ -248,8 +248,8 @@ enclosed' l m docs =
 diffKeyVals
     :: (Eq a, Pretty a)
     => Diff
-    -> InsOrdHashMap Text (Expr s a)
-    -> InsOrdHashMap Text (Expr s a)
+    -> HashMap Text (Expr s a)
+    -> HashMap Text (Expr s a)
     -> [Diff]
 diffKeyVals assign kvsL kvsR =
     diffFieldNames <> diffFieldValues <> (if anyEqual then [ ignore ] else [])
@@ -273,8 +273,9 @@ diffKeyVals assign kvsL kvsR =
     shared = HashMap.intersectionWith diffExpression kvsL kvsR
 
     diffFieldValues =
-        filter (not . same) (HashMap.foldMapWithKey adapt shared)
+        filter (not . same) (foldMapWithKey adapt shared)
       where
+        foldMapWithKey f = HashMap.foldrWithKey (\k v -> (f k v <>)) mempty
         adapt key doc =
             [   (if ksL == ksR then mempty else "  ")
             <>  token (Internal.prettyLabel key)
@@ -391,17 +392,17 @@ isBoth p
 
 diffRecord
     :: (Eq a, Pretty a)
-    => InsOrdHashMap Text (Expr s a) -> InsOrdHashMap Text (Expr s a) -> Diff
+    => HashMap Text (Expr s a) -> HashMap Text (Expr s a) -> Diff
 diffRecord kvsL kvsR = braced (diffKeyVals colon kvsL kvsR)
 
 diffRecordLit
     :: (Eq a, Pretty a)
-    => InsOrdHashMap Text (Expr s a) -> InsOrdHashMap Text (Expr s a) -> Diff
+    => HashMap Text (Expr s a) -> HashMap Text (Expr s a) -> Diff
 diffRecordLit kvsL kvsR = braced (diffKeyVals equals kvsL kvsR)
 
 diffUnion
     :: (Eq a, Pretty a)
-    => InsOrdHashMap Text (Expr s a) -> InsOrdHashMap Text (Expr s a) -> Diff
+    => HashMap Text (Expr s a) -> HashMap Text (Expr s a) -> Diff
 diffUnion kvsL kvsR = angled (diffKeyVals colon kvsL kvsR)
 
 diffUnionLit
@@ -410,8 +411,8 @@ diffUnionLit
     -> Text
     -> Expr s a
     -> Expr s a
-    -> InsOrdHashMap Text (Expr s a)
-    -> InsOrdHashMap Text (Expr s a)
+    -> HashMap Text (Expr s a)
+    -> HashMap Text (Expr s a)
     -> Diff
 diffUnionLit kL kR vL vR kvsL kvsR =
         langle
