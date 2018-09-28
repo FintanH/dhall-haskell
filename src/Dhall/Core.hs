@@ -1396,12 +1396,6 @@ denote (Project a b         ) = Project (denote a) b
 denote (ImportAlt a b       ) = ImportAlt (denote a) (denote b)
 denote (Embed a             ) = Embed a
 
-sortMap :: (Ord k, Hashable k) => HashMap k v -> HashMap k v
-sortMap =
-      Data.HashMap.Strict.fromList
-    . Data.List.sortBy (Data.Ord.comparing fst)
-    . Data.HashMap.Strict.toList
-
 {-| Reduce an expression to its normal form, performing beta reduction and applying
     any custom definitions.
 
@@ -1677,16 +1671,16 @@ normalizeWith ctx e0 = loop (denote e0)
     None -> None
     OptionalFold -> OptionalFold
     OptionalBuild -> OptionalBuild
-    Record kts -> Record (sortMap kts')
+    Record kts -> Record kts'
       where
         kts' = fmap loop kts
-    RecordLit kvs -> RecordLit (sortMap kvs')
+    RecordLit kvs -> RecordLit kvs'
       where
         kvs' = fmap loop kvs
-    Union kts -> Union (sortMap kts')
+    Union kts -> Union kts'
       where
         kts' = fmap loop kts
-    UnionLit k v kvs -> UnionLit k v' (sortMap kvs')
+    UnionLit k v kvs -> UnionLit k v' kvs'
       where
         v'   =      loop v
         kvs' = fmap loop kvs
@@ -1697,7 +1691,7 @@ normalizeWith ctx e0 = loop (denote e0)
         decide l (RecordLit n) | Data.HashMap.Strict.null n =
             l
         decide (RecordLit m) (RecordLit n) =
-            RecordLit (sortMap (Data.HashMap.Strict.unionWith decide m n))
+            RecordLit (Data.HashMap.Strict.unionWith decide m n)
         decide l r =
             Combine l r
     CombineTypes x y -> decide (loop x) (loop y)
@@ -1707,7 +1701,7 @@ normalizeWith ctx e0 = loop (denote e0)
         decide l (Record n) | Data.HashMap.Strict.null n =
             l
         decide (Record m) (Record n) =
-            Record (sortMap (Data.HashMap.Strict.unionWith decide m n))
+            Record (Data.HashMap.Strict.unionWith decide m n)
         decide l r =
             CombineTypes l r
 
@@ -1718,7 +1712,7 @@ normalizeWith ctx e0 = loop (denote e0)
         decide l (RecordLit n) | Data.HashMap.Strict.null n =
             l
         decide (RecordLit m) (RecordLit n) =
-            RecordLit (sortMap (Data.HashMap.Strict.union n m))
+            RecordLit (Data.HashMap.Strict.union n m)
         decide l r =
             Prefer l r
     Merge x y t      ->
