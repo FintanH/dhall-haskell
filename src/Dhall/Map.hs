@@ -52,7 +52,7 @@ import Control.Applicative ((<|>))
 import Data.Data (Data)
 import Prelude hiding (head, lookup, tail)
 
-import qualified Data.Map
+import qualified Data.Map.Strict as Data.Map
 import qualified Data.Set
 
 {-| A `Map` that remembers the original ordering of keys
@@ -62,7 +62,7 @@ import qualified Data.Set
     This is done primarily to avoid a dependency on @insert-ordered-containers@
     and also to improve performance
 -}
-data Map k v = Map (Data.Map.Map k v) [k]
+data Map k v = Map !(Data.Map.Map k v) [k]
     deriving (Data, Show)
 
 instance (Eq k, Eq v) => Eq (Map k v) where

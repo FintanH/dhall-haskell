@@ -470,7 +470,7 @@ typeWithA tpa = loop
                       (Pi "just" (Pi "_" "a" "optional")
                           (Pi "nothing" "optional" "optional") )
     loop ctx e@(Record    kts   ) = do
-        case {-# SCC "RECORD_TOLIST" #-} Dhall.Map.head kts of
+        case Dhall.Map.head kts of
             Nothing       -> return (Const Type)
             Just (k0, t0) -> do
                 s0 <- fmap Dhall.Core.normalize (loop ctx t0)
@@ -501,9 +501,9 @@ typeWithA tpa = loop
                   Nothing -> return (Const Type)
                   Just rest -> Dhall.Map.traverseWithKey_ process rest >> return (Const c)
     loop ctx e@(RecordLit kvs   ) = do
-        case Dhall.Map.toList kvs of
-            []         -> return (Record Dhall.Map.empty)
-            (k0, v0):_ -> do
+        case Dhall.Map.head kvs of
+            Nothing -> return (Record Dhall.Map.empty)
+            Just (k0, v0) -> do
                 t0 <- loop ctx v0
                 s0 <- fmap Dhall.Core.normalize (loop ctx t0)
                 c <- case s0 of
@@ -534,7 +534,7 @@ typeWithA tpa = loop
                         return t
                 kts <- Dhall.Map.traverseWithKey process kvs
                 return (Record kts)
-    loop ctx e@(Union     kts   ) = do
+    loop ctx e@(Union     kts   ) = {-# SCC "UNION" #-} do
         let process k t = Process $ do
                 s <- fmap Dhall.Core.normalize (loop ctx t)
                 case s of
@@ -543,7 +543,7 @@ typeWithA tpa = loop
                     _          -> Left (TypeError ctx e (InvalidAlternativeType k t))
         runProcess (Data.Map.foldMapWithKey process (Dhall.Map.toMap kts))
         return (Const Type)
-    loop ctx e@(UnionLit k v kts) = do
+    loop ctx e@(UnionLit k v kts) = {-# SCC "UNIONLIT" #-} do
         case Dhall.Map.lookup k kts of
             Just _  -> Left (TypeError ctx e (DuplicateAlternative k))
             Nothing -> return ()
