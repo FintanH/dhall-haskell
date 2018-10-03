@@ -30,7 +30,7 @@ import qualified Dhall.TypeCheck
 import qualified System.IO
 
 readInput :: Maybe FilePath -> IO Text
-readInput = maybe Data.Text.IO.getContents Data.Text.IO.readFile
+readInput = maybe Data.Text.IO.getContents (pure . pack)
 
 -- | Retrieve an `Import` and update the hash to match the latest contents
 hashImport :: ProtocolVersion -> Import -> IO Import
@@ -76,11 +76,11 @@ writeExpr inplace (header, expr) = do
 
         Nothing -> do
             supportsANSI <- System.Console.ANSI.hSupportsANSI System.IO.stdout
-            if supportsANSI 
-               then 
+            if supportsANSI
+               then
                  Pretty.renderIO System.IO.stdout (annToAnsiStyle <$> Pretty.layoutSmart layoutOpts doc)
                else
-                 Pretty.renderIO System.IO.stdout (Pretty.layoutSmart layoutOpts (Pretty.unAnnotate doc)) 
+                 Pretty.renderIO System.IO.stdout (Pretty.layoutSmart layoutOpts (Pretty.unAnnotate doc))
 
 -- | Implementation of the @dhall freeze@ subcommand
 freeze
