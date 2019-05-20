@@ -1,4 +1,10 @@
-# `dhall-text 1.0.14`
+# `dhall-text`
+
+For installation or development instructions, see:
+
+* [`dhall-haskell` - `README`](https://github.com/dhall-lang/dhall-haskell/blob/master/README.md)
+
+## Introduction
 
 This `dhall-text` package provides a `dhall-to-text` executable which you can
 use to template text using the Dhall configuration language.

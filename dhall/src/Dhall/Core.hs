@@ -26,7 +26,6 @@ module Dhall.Core (
     , ImportMode(..)
     , ImportType(..)
     , URL(..)
-    , Path
     , Scheme(..)
     , Var(..)
     , Binding(..)
@@ -34,7 +33,7 @@ module Dhall.Core (
     , Expr(..)
 
     -- * Normalization
-    , alphaNormalize
+    , Dhall.Core.alphaNormalize
     , normalize
     , normalizeWith
     , normalizeWithM
@@ -57,7 +56,9 @@ module Dhall.Core (
     , reservedIdentifiers
     , escapeText
     , subExpressions
+    , chunkExprs
     , pathCharacter
+    , throws
     ) where
 
 #if MIN_VERSION_base(4,8,0)
@@ -65,6 +66,8 @@ module Dhall.Core (
 import Control.Applicative (Applicative(..), (<$>))
 #endif
 import Control.Applicative (empty)
+import Control.Exception (Exception)
+import Control.Monad.IO.Class (MonadIO(..))
 import Crypto.Hash (SHA256)
 import Data.Bifunctor (Bifunctor(..))
 import Data.Data (Data)
@@ -85,14 +88,20 @@ import GHC.Generics (Generic)
 import Numeric.Natural (Natural)
 import Prelude hiding (succ)
 
+import qualified Control.Exception
 import qualified Control.Monad
 import qualified Crypto.Hash
+import qualified Data.Char
+import {-# SOURCE #-} qualified Dhall.Eval
 import qualified Data.HashSet
 import qualified Data.Sequence
 import qualified Data.Text
 import qualified Data.Text.Prettyprint.Doc  as Pretty
 import qualified Dhall.Map
 import qualified Dhall.Set
+import qualified Network.URI.Encode         as URI.Encode
+import qualified Text.Printf
+
 
 {-| Constants for a pure type system
 
@@ -176,9 +185,35 @@ data URL = URL
     , authority :: Text
     , path      :: File
     , query     :: Maybe Text
-    , fragment  :: Maybe Text
     , headers   :: Maybe ImportHashed
     } deriving (Eq, Generic, Ord, Show)
+
+instance Pretty URL where
+    pretty (URL {..}) =
+            schemeDoc
+        <>  "://"
+        <>  Pretty.pretty authority
+        <>  pathDoc
+        <>  queryDoc
+        <>  foldMap prettyHeaders headers
+      where
+        prettyHeaders h = " using " <> Pretty.pretty h
+
+        File {..} = path
+
+        Directory {..} = directory
+
+        pathDoc =
+                foldMap prettyURIComponent (reverse components)
+            <>  prettyURIComponent file
+
+        schemeDoc = case scheme of
+            HTTP  -> "http"
+            HTTPS -> "https"
+
+        queryDoc = case query of
+            Nothing -> ""
+            Just q  -> "?" <> Pretty.pretty q
 
 -- | The type of import (i.e. local vs. remote vs. environment)
 data ImportType
@@ -220,28 +255,7 @@ instance Pretty ImportType where
     pretty (Local prefix file) =
         Pretty.pretty prefix <> Pretty.pretty file
 
-    pretty (Remote (URL {..})) =
-            schemeDoc
-        <>  "://"
-        <>  Pretty.pretty authority
-        <>  Pretty.pretty path
-        <>  queryDoc
-        <>  fragmentDoc
-        <>  foldMap prettyHeaders headers
-      where
-        prettyHeaders h = " using " <> Pretty.pretty h
-
-        schemeDoc = case scheme of
-            HTTP  -> "http"
-            HTTPS -> "https"
-
-        queryDoc = case query of
-            Nothing -> ""
-            Just q  -> "?" <> Pretty.pretty q
-
-        fragmentDoc = case fragment of
-            Nothing -> ""
-            Just f  -> "#" <> Pretty.pretty f
+    pretty (Remote url) = Pretty.pretty url
 
     pretty (Env env) = "env:" <> Pretty.pretty env
 
@@ -283,11 +297,6 @@ instance Pretty Import where
         suffix = case importMode of
             RawText -> " as Text"
             Code    -> ""
-
--- | Type synonym for `Import`, provided for backwards compatibility
-type Path = Import
-
-{-# DEPRECATED Path "Use Dhall.Core.Import instead" #-}
 
 {-| Label for a bound variable
 
@@ -405,6 +414,8 @@ data Expr s a
     | TextLit (Chunks s a)
     -- | > TextAppend x y                           ~  x ++ y
     | TextAppend (Expr s a) (Expr s a)
+    -- | > TextShow                                 ~  Text/show
+    | TextShow
     -- | > List                                     ~  List
     | List
     -- | > ListLit (Just t ) [x, y, z]              ~  [x, y, z] : List t
@@ -443,10 +454,10 @@ data Expr s a
     | Record    (Map Text (Expr s a))
     -- | > RecordLit    [(k1, v1), (k2, v2)]        ~  { k1 = v1, k2 = v2 }
     | RecordLit (Map Text (Expr s a))
-    -- | > Union        [(k1, t1), (k2, t2)]        ~  < k1 : t1 | k2 : t2 >
-    | Union     (Map Text (Expr s a))
-    -- | > UnionLit k v [(k1, t1), (k2, t2)]        ~  < k = v | k1 : t1 | k2 : t2 >
-    | UnionLit Text (Expr s a) (Map Text (Expr s a))
+    -- | > Union        [(k1, Just t1), (k2, Nothing)] ~  < k1 : t1 | k2 >
+    | Union     (Map Text (Maybe (Expr s a)))
+    -- | > UnionLit k v [(k1, Just t1), (k2, Nothing)] ~  < k = v | k1 : t1 | k2 >
+    | UnionLit Text (Expr s a) (Map Text (Maybe (Expr s a)))
     -- | > Combine x y                              ~  x ∧ y
     | Combine (Expr s a) (Expr s a)
     -- | > CombineTypes x y                         ~  x ⩓ y
@@ -456,8 +467,6 @@ data Expr s a
     -- | > Merge x y (Just t )                      ~  merge x y : t
     --   > Merge x y  Nothing                       ~  merge x y
     | Merge (Expr s a) (Expr s a) (Maybe (Expr s a))
-    -- | > Constructors e                           ~  constructors e
-    | Constructors (Expr s a)
     -- | > Field e x                                ~  e.x
     | Field (Expr s a) Text
     -- | > Project e xs                             ~  e.{ xs }
@@ -510,6 +519,7 @@ instance Functor (Expr s) where
   fmap _ Text = Text
   fmap f (TextLit cs) = TextLit (fmap f cs)
   fmap f (TextAppend e1 e2) = TextAppend (fmap f e1) (fmap f e2)
+  fmap _ TextShow = TextShow
   fmap _ List = List
   fmap f (ListLit maybeE seqE) = ListLit (fmap (fmap f) maybeE) (fmap (fmap f) seqE)
   fmap f (ListAppend e1 e2) = ListAppend (fmap f e1) (fmap f e2)
@@ -528,13 +538,12 @@ instance Functor (Expr s) where
   fmap _ OptionalBuild = OptionalBuild
   fmap f (Record r) = Record (fmap (fmap f) r)
   fmap f (RecordLit r) = RecordLit (fmap (fmap f) r)
-  fmap f (Union u) = Union (fmap (fmap f) u)
-  fmap f (UnionLit v e u) = UnionLit v (fmap f e) (fmap (fmap f) u)
+  fmap f (Union u) = Union (fmap (fmap (fmap f)) u)
+  fmap f (UnionLit v e u) = UnionLit v (fmap f e) (fmap (fmap (fmap f)) u)
   fmap f (Combine e1 e2) = Combine (fmap f e1) (fmap f e2)
   fmap f (CombineTypes e1 e2) = CombineTypes (fmap f e1) (fmap f e2)
   fmap f (Prefer e1 e2) = Prefer (fmap f e1) (fmap f e2)
   fmap f (Merge e1 e2 maybeE) = Merge (fmap f e1) (fmap f e2) (fmap (fmap f) maybeE)
-  fmap f (Constructors e1) = Constructors (fmap f e1)
   fmap f (Field e1 v) = Field (fmap f e1) v
   fmap f (Project e1 vs) = Project (fmap f e1) vs
   fmap f (Note s e1) = Note s (fmap f e1)
@@ -587,6 +596,7 @@ instance Monad (Expr s) where
     Text                 >>= _ = Text
     TextLit (Chunks a b) >>= k = TextLit (Chunks (fmap (fmap (>>= k)) a) b)
     TextAppend a b       >>= k = TextAppend (a >>= k) (b >>= k)
+    TextShow             >>= _ = TextShow
     List                 >>= _ = List
     ListLit a b          >>= k = ListLit (fmap (>>= k) a) (fmap (>>= k) b)
     ListAppend a b       >>= k = ListAppend (a >>= k) (b >>= k)
@@ -605,13 +615,12 @@ instance Monad (Expr s) where
     OptionalBuild        >>= _ = OptionalBuild
     Record    a          >>= k = Record (fmap (>>= k) a)
     RecordLit a          >>= k = RecordLit (fmap (>>= k) a)
-    Union     a          >>= k = Union (fmap (>>= k) a)
-    UnionLit a b c       >>= k = UnionLit a (b >>= k) (fmap (>>= k) c)
+    Union     a          >>= k = Union (fmap (fmap (>>= k)) a)
+    UnionLit a b c       >>= k = UnionLit a (b >>= k) (fmap (fmap (>>= k)) c)
     Combine a b          >>= k = Combine (a >>= k) (b >>= k)
     CombineTypes a b     >>= k = CombineTypes (a >>= k) (b >>= k)
     Prefer a b           >>= k = Prefer (a >>= k) (b >>= k)
     Merge a b c          >>= k = Merge (a >>= k) (b >>= k) (fmap (>>= k) c)
-    Constructors a       >>= k = Constructors (a >>= k)
     Field a b            >>= k = Field (a >>= k) b
     Project a b          >>= k = Project (a >>= k) b
     Note a b             >>= k = Note a (b >>= k)
@@ -654,6 +663,7 @@ instance Bifunctor Expr where
     first _  Text                  = Text
     first k (TextLit (Chunks a b)) = TextLit (Chunks (fmap (fmap (first k)) a) b)
     first k (TextAppend a b      ) = TextAppend (first k a) (first k b)
+    first _  TextShow              = TextShow
     first _  List                  = List
     first k (ListLit a b         ) = ListLit (fmap (first k) a) (fmap (first k) b)
     first k (ListAppend a b      ) = ListAppend (first k a) (first k b)
@@ -672,13 +682,12 @@ instance Bifunctor Expr where
     first _  OptionalBuild         = OptionalBuild
     first k (Record a            ) = Record (fmap (first k) a)
     first k (RecordLit a         ) = RecordLit (fmap (first k) a)
-    first k (Union a             ) = Union (fmap (first k) a)
-    first k (UnionLit a b c      ) = UnionLit a (first k b) (fmap (first k) c)
+    first k (Union a             ) = Union (fmap (fmap (first k)) a)
+    first k (UnionLit a b c      ) = UnionLit a (first k b) (fmap (fmap (first k)) c)
     first k (Combine a b         ) = Combine (first k a) (first k b)
     first k (CombineTypes a b    ) = CombineTypes (first k a) (first k b)
     first k (Prefer a b          ) = Prefer (first k a) (first k b)
     first k (Merge a b c         ) = Merge (first k a) (first k b) (fmap (first k) c)
-    first k (Constructors a      ) = Constructors (first k a)
     first k (Field a b           ) = Field (first k a) b
     first k (Project a b         ) = Project (first k a) b
     first k (Note a b            ) = Note (k a) (first k b)
@@ -828,14 +837,15 @@ shift d (V x₀ n₀) (Let (Binding x₁ mA₀ a₀ :| []) b₀) =
 
     b₁  =       shift d (V x₀ n₁)   b₀
 shift d (V x₀ n₀) (Let (Binding x₁ mA₀ a₀ :| (l₀ : ls₀)) b₀) =
-    Let (Binding x₁ mA₁ a₁ :| (l₁ : ls₁)) b₁
+    case shift d (V x₀ n₁) (Let (l₀ :| ls₀) b₀) of
+        Let (l₁ :| ls₁) b₁ -> Let (Binding x₁ mA₁ a₁ :| (l₁ : ls₁)) b₁
+        e                  -> Let (Binding x₁ mA₁ a₁ :|       []  ) e
   where
     n₁ = if x₀ == x₁ then n₀ + 1 else n₀
 
     mA₁ = fmap (shift d (V x₀ n₀)) mA₀
     a₁  =       shift d (V x₀ n₀)   a₀
 
-    Let (l₁ :| ls₁) b₁ = shift d (V x₀ n₁) (Let (l₀ :| ls₀) b₀)
 shift d v (Annot a b) = Annot a' b'
   where
     a' = shift d v a
@@ -895,6 +905,7 @@ shift d v (TextAppend a b) = TextAppend a' b'
   where
     a' = shift d v a
     b' = shift d v b
+shift _ _ TextShow = TextShow
 shift _ _ List = List
 shift d v (ListLit a b) = ListLit a' b'
   where
@@ -930,11 +941,11 @@ shift d v (RecordLit a) = RecordLit a'
     a' = fmap (shift d v) a
 shift d v (Union a) = Union a'
   where
-    a' = fmap (shift d v) a
+    a' = fmap (fmap (shift d v)) a
 shift d v (UnionLit a b c) = UnionLit a b' c'
   where
-    b' =       shift d v  b
-    c' = fmap (shift d v) c
+    b' =             shift d v   b
+    c' = fmap (fmap (shift d v)) c
 shift d v (Combine a b) = Combine a' b'
   where
     a' = shift d v a
@@ -952,9 +963,6 @@ shift d v (Merge a b c) = Merge a' b' c'
     a' =       shift d v  a
     b' =       shift d v  b
     c' = fmap (shift d v) c
-shift d v (Constructors a) = Constructors a'
-  where
-    a' = shift d v  a
 shift d v (Field a b) = Field a' b
   where
     a' = shift d v a
@@ -1005,7 +1013,9 @@ subst (V x₀ n₀) e₀ (Let (Binding x₁ mA₀ a₀ :| []) b₀) =
 
     b₁  =       subst (V x₀ n₁) e₁   b₀
 subst (V x₀ n₀) e₀ (Let (Binding x₁ mA₀ a₀ :| (l₀ : ls₀)) b₀) =
-    Let (Binding x₁ mA₁ a₁ :| (l₁ : ls₁)) b₁
+    case subst (V x₀ n₁) e₁ (Let (l₀ :| ls₀) b₀) of
+        Let (l₁ :| ls₁) b₁ -> Let (Binding x₁ mA₁ a₁ :| (l₁ : ls₁)) b₁
+        e                  -> Let (Binding x₁ mA₁ a₁ :|       []  ) e
   where
     n₁ = if x₀ == x₁ then n₀ + 1 else n₀
 
@@ -1014,7 +1024,6 @@ subst (V x₀ n₀) e₀ (Let (Binding x₁ mA₀ a₀ :| (l₀ : ls₀)) b₀) 
     mA₁ = fmap (subst (V x₀ n₀) e₀) mA₀
     a₁  =       subst (V x₀ n₀) e₀   a₀
 
-    Let (l₁ :| ls₁) b₁ = subst (V x₀ n₁) e₁ (Let (l₀ :| ls₀) b₀)
 subst x e (Annot a b) = Annot a' b'
   where
     a' = subst x e a
@@ -1074,6 +1083,7 @@ subst x e (TextAppend a b) = TextAppend a' b'
   where
     a' = subst x e a
     b' = subst x e b
+subst _ _ TextShow = TextShow
 subst _ _ List = List
 subst x e (ListLit a b) = ListLit a' b'
   where
@@ -1101,10 +1111,19 @@ subst x e (Some a) = Some a'
 subst _ _ None = None
 subst _ _ OptionalFold = OptionalFold
 subst _ _ OptionalBuild = OptionalBuild
-subst x e (Record       kts) = Record                   (fmap (subst x e) kts)
-subst x e (RecordLit    kvs) = RecordLit                (fmap (subst x e) kvs)
-subst x e (Union        kts) = Union                    (fmap (subst x e) kts)
-subst x e (UnionLit a b kts) = UnionLit a (subst x e b) (fmap (subst x e) kts)
+subst x e (Record kts) = Record kts'
+  where
+    kts' = fmap (subst x e) kts
+subst x e (RecordLit kvs) = RecordLit kvs'
+  where
+    kvs' = fmap (subst x e) kvs
+subst x e (Union kts) = Union kts'
+  where
+    kts' = fmap (fmap (subst x e)) kts
+subst x e (UnionLit a b kts) = UnionLit a b' kts'
+  where
+    b'   =             subst x e   b
+    kts' = fmap (fmap (subst x e)) kts
 subst x e (Combine a b) = Combine a' b'
   where
     a' = subst x e a
@@ -1122,9 +1141,6 @@ subst x e (Merge a b c) = Merge a' b' c'
     a' =       subst x e  a
     b' =       subst x e  b
     c' = fmap (subst x e) c
-subst x e (Constructors a) = Constructors a'
-  where
-    a' = subst x e  a
 subst x e (Field a b) = Field a' b
   where
     a' = subst x e a
@@ -1155,295 +1171,7 @@ Var (V "x" 0)
 
 -}
 alphaNormalize :: Expr s a -> Expr s a
-alphaNormalize (Const c) =
-    Const c
-alphaNormalize (Var v) =
-    Var v
-alphaNormalize (Lam "_" _A₀ b₀) =
-    Lam "_" _A₁ b₁
-  where
-    _A₁ = alphaNormalize _A₀
-    b₁  = alphaNormalize b₀
-alphaNormalize (Lam x _A₀ b₀) =
-    Lam "_" _A₁ b₄
-  where
-    _A₁ = alphaNormalize _A₀
-
-    b₁ = shift 1 (V "_" 0) b₀
-    b₂ = subst (V x 0) (Var (V "_" 0)) b₁
-    b₃ = shift (-1) (V x 0) b₂
-    b₄ = alphaNormalize b₃
-alphaNormalize (Pi "_" _A₀ _B₀) =
-    Pi "_" _A₁ _B₁
-  where
-    _A₁ = alphaNormalize _A₀
-    _B₁ = alphaNormalize _B₀
-alphaNormalize (Pi x _A₀ _B₀) =
-    Pi "_" _A₁ _B₄
-  where
-    _A₁ = alphaNormalize _A₀
-
-    _B₁ = shift 1 (V "_" 0) _B₀
-    _B₂ = subst (V x 0) (Var (V "_" 0)) _B₁
-    _B₃ = shift (-1) (V x 0) _B₂
-    _B₄ = alphaNormalize _B₃
-alphaNormalize (App f₀ a₀) =
-    App f₁ a₁
-  where
-    f₁ = alphaNormalize f₀
-
-    a₁ = alphaNormalize a₀
-alphaNormalize (Let (Binding "_" mA₀ a₀ :| []) b₀) =
-    Let (Binding "_" mA₁ a₁ :| []) b₁
-  where
-    mA₁ = fmap alphaNormalize mA₀
-    a₁  =      alphaNormalize a₀
-
-    b₁  =      alphaNormalize b₀
-alphaNormalize (Let (Binding "_" mA₀ a₀ :| (l₀ : ls₀)) b₀) =
-    Let (Binding "_" mA₁ a₁ :| (l₁ : ls₁)) b₁
-  where
-    mA₁ = fmap alphaNormalize mA₀
-    a₁  =      alphaNormalize  a₀
-
-    Let (l₁ :| ls₁) b₁ = alphaNormalize (Let (l₀ :| ls₀) b₀)
-alphaNormalize (Let (Binding x mA₀ a₀ :| []) b₀) =
-    Let (Binding "_" mA₁ a₁ :| []) b₄
-  where
-    mA₁ = fmap alphaNormalize mA₀
-    a₁  =      alphaNormalize a₀
-
-    b₁ = shift 1 (V "_" 0) b₀
-    b₂ = subst (V x 0) (Var (V "_" 0)) b₁
-    b₃ = shift (-1) (V x 0) b₂
-    b₄ = alphaNormalize b₃
-alphaNormalize (Let (Binding x mA₀ a₀ :| (l₀ : ls₀)) b₀) =
-    Let (Binding "_" mA₁ a₁ :| (l₁ : ls₁)) b₄
-  where
-    mA₁ = fmap alphaNormalize mA₀
-    a₁  =      alphaNormalize a₀
-
-    b₁ = shift 1 (V "_" 0) b₀
-    b₂ = subst (V x 0) (Var (V "_" 0)) b₁
-    b₃ = shift (-1) (V x 0) b₂
-
-    Let (l₁ :| ls₁) b₄ = alphaNormalize (Let (l₀ :| ls₀) b₃)
-alphaNormalize (Annot t₀ _T₀) =
-    Annot t₁ _T₁
-  where
-    t₁ = alphaNormalize t₀
-
-    _T₁ = alphaNormalize _T₀
-alphaNormalize Bool =
-    Bool
-alphaNormalize (BoolLit b) =
-    BoolLit b
-alphaNormalize (BoolAnd l₀ r₀) =
-    BoolAnd l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (BoolOr l₀ r₀) =
-    BoolOr l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (BoolEQ l₀ r₀) =
-    BoolEQ l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (BoolNE l₀ r₀) =
-    BoolNE l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (BoolIf t₀ l₀ r₀) =
-    BoolIf t₁ l₁ r₁
-  where
-    t₁ = alphaNormalize t₀
-
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize Natural =
-    Natural
-alphaNormalize (NaturalLit n) =
-    NaturalLit n
-alphaNormalize NaturalFold =
-    NaturalFold
-alphaNormalize NaturalBuild =
-    NaturalBuild
-alphaNormalize NaturalIsZero =
-    NaturalIsZero
-alphaNormalize NaturalEven =
-    NaturalEven
-alphaNormalize NaturalOdd =
-    NaturalOdd
-alphaNormalize NaturalToInteger =
-    NaturalToInteger
-alphaNormalize NaturalShow =
-    NaturalShow
-alphaNormalize (NaturalPlus l₀ r₀) =
-    NaturalPlus l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (NaturalTimes l₀ r₀) =
-    NaturalTimes l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize Integer =
-    Integer
-alphaNormalize (IntegerLit n) =
-    IntegerLit n
-alphaNormalize IntegerShow =
-    IntegerShow
-alphaNormalize IntegerToDouble =
-    IntegerToDouble
-alphaNormalize Double =
-    Double
-alphaNormalize (DoubleLit n) =
-    DoubleLit n
-alphaNormalize DoubleShow =
-    DoubleShow
-alphaNormalize Text =
-    Text
-alphaNormalize (TextLit (Chunks xys₀ z)) =
-    TextLit (Chunks xys₁ z)
-  where
-    xys₁ = do
-        (x, y₀) <- xys₀
-        let y₁ = alphaNormalize y₀
-        return (x, y₁)
-alphaNormalize (TextAppend l₀ r₀) =
-    TextAppend l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize List =
-    List
-alphaNormalize (ListLit (Just _T₀) ts₀) =
-    ListLit (Just _T₁) ts₁
-  where
-    _T₁ = alphaNormalize _T₀
-
-    ts₁ = fmap alphaNormalize ts₀
-alphaNormalize (ListLit Nothing ts₀) =
-    ListLit Nothing ts₁
-  where
-    ts₁ = fmap alphaNormalize ts₀
-alphaNormalize (ListAppend l₀ r₀) =
-    ListAppend l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize ListBuild =
-    ListBuild
-alphaNormalize ListFold =
-    ListFold
-alphaNormalize ListLength =
-    ListLength
-alphaNormalize ListHead =
-    ListHead
-alphaNormalize ListLast =
-    ListLast
-alphaNormalize ListIndexed =
-    ListIndexed
-alphaNormalize ListReverse =
-    ListReverse
-alphaNormalize Optional =
-    Optional
-alphaNormalize (OptionalLit _T₀ ts₀) =
-    OptionalLit _T₁ ts₁
-  where
-    _T₁ = alphaNormalize _T₀
-
-    ts₁ = fmap alphaNormalize ts₀
-alphaNormalize (Some a₀) = Some a₁
-  where
-    a₁ = alphaNormalize a₀
-alphaNormalize None = None
-alphaNormalize OptionalFold =
-    OptionalFold
-alphaNormalize OptionalBuild =
-    OptionalBuild
-alphaNormalize (Record kts₀) =
-    Record kts₁
-  where
-    kts₁ = fmap alphaNormalize kts₀
-alphaNormalize (RecordLit kvs₀) =
-    RecordLit kvs₁
-  where
-    kvs₁ = fmap alphaNormalize kvs₀
-alphaNormalize (Union kts₀) =
-    Union kts₁
-  where
-    kts₁ = fmap alphaNormalize kts₀
-alphaNormalize (UnionLit k v₀ kts₀) =
-    UnionLit k v₁ kts₁
-  where
-    v₁ = alphaNormalize v₀
-
-    kts₁ = fmap alphaNormalize kts₀
-alphaNormalize (Combine l₀ r₀) =
-    Combine l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (CombineTypes l₀ r₀) =
-    CombineTypes l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (Prefer l₀ r₀) =
-    Prefer l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-
-    r₁ = alphaNormalize r₀
-alphaNormalize (Merge t₀ u₀ _T₀) =
-    Merge t₁ u₁ _T₁
-  where
-    t₁ = alphaNormalize t₀
-
-    u₁ = alphaNormalize u₀
-
-    _T₁ = fmap alphaNormalize _T₀
-alphaNormalize (Constructors u₀) =
-    Constructors u₁
-  where
-    u₁ = alphaNormalize u₀
-alphaNormalize (Field e₀ a) =
-    Field e₁ a
-  where
-    e₁ = alphaNormalize e₀
-alphaNormalize (Project e₀ a) =
-    Project e₁ a
-  where
-    e₁ = alphaNormalize e₀
-alphaNormalize (Note s e₀) =
-    Note s e₁
-  where
-    e₁ = alphaNormalize e₀
-alphaNormalize (ImportAlt l₀ r₀) =
-    ImportAlt l₁ r₁
-  where
-    l₁ = alphaNormalize l₀
-    r₁ = alphaNormalize r₀
-alphaNormalize (Embed a) =
-    Embed a
+alphaNormalize = Dhall.Eval.alphaNormalize
 
 {-| Reduce an expression to its normal form, performing beta reduction
 
@@ -1454,8 +1182,10 @@ alphaNormalize (Embed a) =
     However, `normalize` will not fail if the expression is ill-typed and will
     leave ill-typed sub-expressions unevaluated.
 -}
+
 normalize :: Eq a => Expr s a -> Expr t a
-normalize = normalizeWith (const (pure Nothing))
+normalize = Dhall.Eval.nfEmpty
+
 
 {-| This function is used to determine whether folds like @Natural/fold@ or
     @List/fold@ should be lazy or strict in their accumulator based on the type
@@ -1476,7 +1206,7 @@ boundedType Text             = True
 boundedType (App List _)     = False
 boundedType (App Optional t) = boundedType t
 boundedType (Record kvs)     = all boundedType kvs
-boundedType (Union kvs)      = all boundedType kvs
+boundedType (Union kvs)      = all (all boundedType) kvs
 boundedType _                = False
 
 -- | Remove all `Note` constructors from an `Expr` (i.e. de-`Note`)
@@ -1519,6 +1249,7 @@ denote  DoubleShow            = DoubleShow
 denote  Text                  = Text
 denote (TextLit (Chunks a b)) = TextLit (Chunks (fmap (fmap denote) a) b)
 denote (TextAppend a b      ) = TextAppend (denote a) (denote b)
+denote  TextShow              = TextShow
 denote  List                  = List
 denote (ListLit a b         ) = ListLit (fmap denote a) (fmap denote b)
 denote (ListAppend a b      ) = ListAppend (denote a) (denote b)
@@ -1537,13 +1268,12 @@ denote  OptionalFold          = OptionalFold
 denote  OptionalBuild         = OptionalBuild
 denote (Record a            ) = Record (fmap denote a)
 denote (RecordLit a         ) = RecordLit (fmap denote a)
-denote (Union a             ) = Union (fmap denote a)
-denote (UnionLit a b c      ) = UnionLit a (denote b) (fmap denote c)
+denote (Union a             ) = Union (fmap (fmap denote) a)
+denote (UnionLit a b c      ) = UnionLit a (denote b) (fmap (fmap denote) c)
 denote (Combine a b         ) = Combine (denote a) (denote b)
 denote (CombineTypes a b    ) = CombineTypes (denote a) (denote b)
 denote (Prefer a b          ) = Prefer (denote a) (denote b)
 denote (Merge a b c         ) = Merge (denote a) (denote b) (fmap denote c)
-denote (Constructors a      ) = Constructors (denote a)
 denote (Field a b           ) = Field (denote a) b
 denote (Project a b         ) = Project (denote a) b
 denote (ImportAlt a b       ) = ImportAlt (denote a) (denote b)
@@ -1564,10 +1294,12 @@ denote (Embed a             ) = Embed a
     with those functions is not total either.
 
 -}
-normalizeWith :: Eq a => Normalizer a -> Expr s a -> Expr t a
-normalizeWith ctx = runIdentity . normalizeWithM ctx
+normalizeWith :: Eq a => Maybe (ReifiedNormalizer a) -> Expr s a -> Expr t a
+normalizeWith (Just ctx) t = runIdentity (normalizeWithM (getReifiedNormalizer ctx) t)
+normalizeWith _          t = Dhall.Eval.nfEmpty t
 
-normalizeWithM :: (Eq a, Monad m) => NormalizerM m a -> Expr s a -> m (Expr t a)
+normalizeWithM
+    :: (Monad m, Eq a) => NormalizerM m a -> Expr s a -> m (Expr t a)
 normalizeWithM ctx e0 = loop (denote e0)
  where
  loop e =  case e of
@@ -1587,14 +1319,16 @@ normalizeWithM ctx e0 = loop (denote e0)
           Just e1 -> loop e1
           Nothing -> do
               f' <- loop f
+              a' <- loop a
               case f' of
-                Lam x _A b -> loop b''
-                  where
-                    a'  = shift   1  (V x 0) a
-                    b'  = subst (V x 0) a' b
-                    b'' = shift (-1) (V x 0) b'
+                Lam x _A b₀ -> do
+
+                    let a₂ = shift 1 (V x 0) a'
+                    let b₁ = subst (V x 0) a₂ b₀
+                    let b₂ = shift (-1) (V x 0) b₁
+
+                    loop b₂
                 _ -> do
-                  a' <- loop a
                   case App f' a' of
                     -- build/fold fusion for `List`
                     App (App ListBuild _) (App (App ListFold _) e') -> loop e'
@@ -1709,20 +1443,27 @@ normalizeWithM ctx e0 = loop (denote e0)
                         loop nothing
                     App (App (App (App (App OptionalFold _) (Some x)) _) just) _ ->
                         loop (App just x)
+                    App TextShow (TextLit (Chunks [] oldText)) ->
+                        loop (TextLit (Chunks [] newText))
+                      where
+                        newText = textShow oldText
                     _ -> do
                         res2 <- ctx (App f' a')
                         case res2 of
                             Nothing -> pure (App f' a')
                             Just app' -> loop app'
-    Let (Binding x _ a₀ :| ls₀) b₀ -> loop b₂
-      where
-        rest = case ls₀ of
-            []       -> b₀
-            l₁ : ls₁ -> Let (l₁ :| ls₁) b₀
+    Let (Binding x _ a₀ :| ls₀) b₀ -> do
+        a₁ <- loop a₀
 
-        a₁ = shift 1 (V x 0) a₀
-        b₁ = subst (V x 0) a₁ rest
-        b₂ = shift (-1) (V x 0) b₁
+        rest <- case ls₀ of
+                []       -> loop b₀
+                l₁ : ls₁ -> loop (Let (l₁ :| ls₁) b₀)
+
+        let a₂ = shift 1 (V x 0) a₁
+        let b₁ = subst (V x 0) a₂ rest
+        let b₂ = shift (-1) (V x 0) b₁
+
+        loop b₂
     Annot x _ -> loop x
     Bool -> pure Bool
     BoolLit b -> pure (BoolLit b)
@@ -1811,15 +1552,8 @@ normalizeWithM ctx e0 = loop (denote e0)
           case y' of
             TextLit c -> pure [Chunks [] x, c]
             _         -> pure [Chunks [(x, y')] mempty]
-    TextAppend x y -> decide <$> loop x <*> loop y
-      where
-        isEmpty (Chunks [] "") = True
-        isEmpty  _             = False
-
-        decide (TextLit m)  r          | isEmpty m = r
-        decide  l          (TextLit n) | isEmpty n = l
-        decide (TextLit m) (TextLit n)             = TextLit (m <> n)
-        decide  l           r                      = TextAppend l r
+    TextAppend x y -> loop (TextLit (Chunks [("", x), ("", y)] ""))
+    TextShow -> pure TextShow
     List -> pure List
     ListLit t es
         | Data.Sequence.null es -> ListLit <$> t' <*> es'
@@ -1857,11 +1591,11 @@ normalizeWithM ctx e0 = loop (denote e0)
         kvs' = traverse loop kvs
     Union kts -> Union . Dhall.Map.sort <$> kts'
       where
-        kts' = traverse loop kts
+        kts' = traverse (traverse loop) kts
     UnionLit k v kvs -> UnionLit k <$> v' <*> (Dhall.Map.sort <$> kvs')
       where
-        v'   =          loop v
-        kvs' = traverse loop kvs
+        v'   =                    loop  v
+        kvs' = traverse (traverse loop) kvs
     Combine x y -> decide <$> loop x <*> loop y
       where
         decide (RecordLit m) r | Data.Foldable.null m =
@@ -1902,15 +1636,26 @@ normalizeWithM ctx e0 = loop (denote e0)
                         case Dhall.Map.lookup kY kvsX of
                             Just vX -> loop (App vX vY)
                             Nothing -> Merge x' y' <$> t'
+                    Field (Union ktsY) kY ->
+                        case Dhall.Map.lookup kY ktsY of
+                            Just Nothing ->
+                                case Dhall.Map.lookup kY kvsX of
+                                    Just vX -> return vX
+                                    Nothing -> Merge x' y' <$> t'
+                            _ ->
+                                Merge x' y' <$> t'
+                    App (Field (Union ktsY) kY) vY ->
+                        case Dhall.Map.lookup kY ktsY of
+                            Just (Just _) ->
+                                case Dhall.Map.lookup kY kvsX of
+                                    Just vX -> loop (App vX vY)
+                                    Nothing -> Merge x' y' <$> t'
+                            _ ->
+                                Merge x' y' <$> t'
                     _ -> Merge x' y' <$> t'
             _ -> Merge x' y' <$> t'
       where
         t' = traverse loop t
-    Constructors t   -> do
-        t' <- loop t
-        case t' of
-            u@(Union _) -> pure u
-            _           -> pure $ Constructors t'
     Field r x        -> do
         r' <- loop r
         case r' of
@@ -1918,13 +1663,6 @@ normalizeWithM ctx e0 = loop (denote e0)
                 case Dhall.Map.lookup x kvs of
                     Just v  -> loop v
                     Nothing -> Field <$> (RecordLit <$> traverse loop kvs) <*> pure x
-            Union kvs ->
-                case Dhall.Map.lookup x kvs of
-                    Just t_ -> Lam x <$> t' <*> pure (UnionLit x (Var (V x 0)) rest)
-                      where
-                        t' = loop t_
-                        rest = Dhall.Map.delete x kvs
-                    Nothing -> Field <$> (Union <$> traverse loop kvs) <*> pure x
             _ -> pure (Field r' x)
     Project r xs     -> do
         r' <- loop r
@@ -1941,19 +1679,31 @@ normalizeWithM ctx e0 = loop (denote e0)
                 adapt x = do
                     v <- Dhall.Map.lookup x kvs
                     return (x, v)
-            _ -> pure (Project r' xs)
+            _   | null xs -> pure (RecordLit mempty)
+                | otherwise -> pure (Project r' xs)
     Note _ e' -> loop e'
     ImportAlt l _r -> loop l
     Embed a -> pure (Embed a)
+
+textShow :: Text -> Text
+textShow text = "\"" <> Data.Text.concatMap f text <> "\""
+  where
+    f '"'  = "\\\""
+    f '$'  = "\\u0024"
+    f '\\' = "\\\\"
+    f '\b' = "\\b"
+    f '\n' = "\\n"
+    f '\r' = "\\r"
+    f '\t' = "\\t"
+    f '\f' = "\\f"
+    f c | c <= '\x1F' = Data.Text.pack (Text.Printf.printf "\\u%04x" (Data.Char.ord c))
+        | otherwise   = Data.Text.singleton c
 
 {-| Returns `True` if two expressions are α-equivalent and β-equivalent and
     `False` otherwise
 -}
 judgmentallyEqual :: Eq a => Expr s a -> Expr t a -> Bool
-judgmentallyEqual eL0 eR0 = alphaBetaNormalize eL0 == alphaBetaNormalize eR0
-  where
-    alphaBetaNormalize :: Eq a => Expr s a -> Expr () a
-    alphaBetaNormalize = alphaNormalize . normalize
+judgmentallyEqual = Dhall.Eval.convEmpty
 
 -- | Use this to wrap you embedded functions (see `normalizeWith`) to make them
 --   polymorphic enough to be used.
@@ -1963,7 +1713,7 @@ type Normalizer a = NormalizerM Identity a
 
 -- | A reified 'Normalizer', which can be stored in structures without
 -- running into impredicative polymorphism.
-data ReifiedNormalizer a = ReifiedNormalizer
+newtype ReifiedNormalizer a = ReifiedNormalizer
   { getReifiedNormalizer :: Normalizer a }
 
 -- | Check if an expression is in a normal form given a context of evaluation.
@@ -1971,7 +1721,7 @@ data ReifiedNormalizer a = ReifiedNormalizer
 --
 --   It is much more efficient to use `isNormalized`.
 isNormalizedWith :: (Eq s, Eq a) => Normalizer a -> Expr s a -> Bool
-isNormalizedWith ctx e = e == normalizeWith ctx e
+isNormalizedWith ctx e = e == normalizeWith (Just (ReifiedNormalizer ctx)) e
 
 -- | Quickly check if an expression is in normal form
 isNormalized :: Eq a => Expr s a -> Bool
@@ -2016,6 +1766,8 @@ isNormalized e0 = loop (denote e0)
           App (App (App (App (App OptionalFold _) (Some _)) _) _) _ ->
               False
           App (App (App (App (App OptionalFold _) (App None _)) _) _) _ ->
+              False
+          App TextShow (TextLit (Chunks [] _)) ->
               False
           _ -> True
       Let _ _ -> False
@@ -2085,15 +1837,8 @@ isNormalized e0 = loop (denote e0)
           check y = loop y && case y of
               TextLit _ -> False
               _         -> True
-      TextAppend x y -> loop x && loop y && decide x y
-        where
-          isEmpty (Chunks [] "") = True
-          isEmpty  _             = False
-
-          decide (TextLit m)  _          | isEmpty m = False
-          decide  _          (TextLit n) | isEmpty n = False
-          decide (TextLit _) (TextLit _)             = False
-          decide  _           _                      = True
+      TextAppend _ _ -> False
+      TextShow -> True
       List -> True
       ListLit t es -> all loop t && all loop es
       ListAppend x y -> loop x && loop y && decide x y
@@ -2117,8 +1862,8 @@ isNormalized e0 = loop (denote e0)
       OptionalBuild -> True
       Record kts -> Dhall.Map.isSorted kts && all loop kts
       RecordLit kvs -> Dhall.Map.isSorted kvs && all loop kvs
-      Union kts -> Dhall.Map.isSorted kts && all loop kts
-      UnionLit _ v kvs -> loop v && Dhall.Map.isSorted kvs && all loop kvs
+      Union kts -> Dhall.Map.isSorted kts && all (all loop) kts
+      UnionLit _ v kvs -> loop v && Dhall.Map.isSorted kvs && all (all loop) kvs
       Combine x y -> loop x && loop y && decide x y
         where
           decide (RecordLit m) _ | Data.Foldable.null m = False
@@ -2147,11 +1892,6 @@ isNormalized e0 = loop (denote e0)
                               Nothing -> True
                       _ -> True
               _ -> True
-      Constructors t -> loop t &&
-          case t of
-              Union _ -> False
-              _       -> True
-
       Field r x -> loop r &&
           case r of
               RecordLit kvs ->
@@ -2169,7 +1909,7 @@ isNormalized e0 = loop (denote e0)
                   if all (flip Dhall.Map.member kvs) xs
                       then False
                       else True
-              _ -> True
+              _ -> not (null xs)
       Note _ e' -> loop e'
       ImportAlt l _r -> loop l
       Embed _ -> True
@@ -2249,6 +1989,7 @@ reservedIdentifiers =
         , "Double"
         , "Double/show"
         , "Text"
+        , "Text/show"
         , "List"
         , "List/build"
         , "List/fold"
@@ -2304,9 +2045,10 @@ subExpressions _ Double = pure Double
 subExpressions _ (DoubleLit n) = pure (DoubleLit n)
 subExpressions _ DoubleShow = pure DoubleShow
 subExpressions _ Text = pure Text
-subExpressions f (TextLit (Chunks a b)) =
-    TextLit <$> (Chunks <$> traverse (traverse f) a <*> pure b)
+subExpressions f (TextLit chunks) =
+    TextLit <$> chunkExprs f chunks
 subExpressions f (TextAppend a b) = TextAppend <$> f a <*> f b
+subExpressions _ TextShow = pure TextShow
 subExpressions _ List = pure List
 subExpressions f (ListLit a b) = ListLit <$> traverse f a <*> traverse f b
 subExpressions f (ListAppend a b) = ListAppend <$> f a <*> f b
@@ -2325,18 +2067,26 @@ subExpressions _ OptionalFold = pure OptionalFold
 subExpressions _ OptionalBuild = pure OptionalBuild
 subExpressions f (Record a) = Record <$> traverse f a
 subExpressions f ( RecordLit a ) = RecordLit <$> traverse f a
-subExpressions f (Union a) = Union <$> traverse f a
-subExpressions f (UnionLit a b c) = UnionLit a <$> f b <*> traverse f c
+subExpressions f (Union a) = Union <$> traverse (traverse f) a
+subExpressions f (UnionLit a b c) =
+    UnionLit a <$> f b <*> traverse (traverse f) c
 subExpressions f (Combine a b) = Combine <$> f a <*> f b
 subExpressions f (CombineTypes a b) = CombineTypes <$> f a <*> f b
 subExpressions f (Prefer a b) = Prefer <$> f a <*> f b
 subExpressions f (Merge a b t) = Merge <$> f a <*> f b <*> traverse f t
-subExpressions f (Constructors a) = Constructors <$> f a
 subExpressions f (Field a b) = Field <$> f a <*> pure b
 subExpressions f (Project a b) = Project <$> f a <*> pure b
 subExpressions f (Note a b) = Note a <$> f b
 subExpressions f (ImportAlt l r) = ImportAlt <$> f l <*> f r
 subExpressions _ (Embed a) = pure (Embed a)
+
+-- | A traversal over the immediate sub-expressions in 'Chunks'.
+chunkExprs
+  :: Applicative f
+  => (Expr s a -> f (Expr t b))
+  -> Chunks s a -> f (Chunks t b)
+chunkExprs f (Chunks chunks final) =
+  flip Chunks final <$> traverse (traverse f) chunks
 
 {-| Returns `True` if the given `Char` is valid within an unquoted path
     component
@@ -2362,3 +2112,17 @@ prettyPathComponent text
         "/" <> Pretty.pretty text
     | otherwise =
         "/\"" <> Pretty.pretty text <> "\""
+
+prettyURIComponent :: Text -> Doc ann
+prettyURIComponent text
+    | Data.Text.all (\c -> pathCharacter c && URI.Encode.isAllowed c) text =
+        "/" <> Pretty.pretty text
+    | otherwise =
+        "/\"" <> Pretty.pretty text <> "\""
+
+{-| Convenience utility for converting `Either`-based exceptions to `IO`-based
+    exceptions
+-}
+throws :: (Exception e, MonadIO io) => Either e a -> io a
+throws (Left  e) = liftIO (Control.Exception.throwIO e)
+throws (Right r) = return r

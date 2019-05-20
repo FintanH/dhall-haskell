@@ -1,8 +1,6 @@
-{-# LANGUAGE ApplicativeDo      #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE OverloadedLists    #-}
-{-# LANGUAGE OverloadedStrings  #-}
-{-# LANGUAGE RecordWildCards    #-}
+{-# LANGUAGE OverloadedLists   #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 {-| This library only exports a single `dhallToJSON` function for translating a
     Dhall syntax tree to a JSON syntax tree (i.e. a `Value`) for the @aeson@
@@ -162,10 +160,15 @@ module Dhall.JSON (
     -- * Dhall to JSON
       dhallToJSON
     , omitNull
+    , omitEmpty
+    , parseOmission
     , Conversion(..)
     , convertToHomogeneousMaps
     , parseConversion
+    , SpecialDoubleMode(..)
+    , handleSpecialDoubles
     , codeToValue
+    , jsonToYaml
 
     -- * Exceptions
     , CompileError(..)
@@ -177,23 +180,27 @@ import Control.Exception (Exception, throwIO)
 import Data.Aeson (Value(..), ToJSON(..))
 import Data.Monoid ((<>), mempty)
 import Data.Text (Text)
-import Data.Typeable (Typeable)
 import Dhall.Core (Expr)
 import Dhall.TypeCheck (X)
 import Dhall.Map (Map)
 import Options.Applicative (Parser)
 
+import qualified Control.Lens
+import qualified Data.ByteString
 import qualified Data.Foldable
 import qualified Data.HashMap.Strict
 import qualified Data.List
 import qualified Data.Ord
 import qualified Data.Text
+import qualified Data.Vector
+import qualified Data.Yaml
 import qualified Dhall.Core
 import qualified Dhall.Import
 import qualified Dhall.Map
 import qualified Dhall.Parser
 import qualified Dhall.TypeCheck
 import qualified Options.Applicative
+import qualified Text.Libyaml
 
 {-| This is the exception type for errors that might arise when translating
     Dhall to JSON
@@ -201,19 +208,65 @@ import qualified Options.Applicative
     Because the majority of Dhall language features do not translate to JSON
     this just returns the expression that failed
 -}
-data CompileError = Unsupported (Expr X X) deriving (Typeable)
+data CompileError
+    = Unsupported (Expr X X)
+    | SpecialDouble Double
+    | BareNone
 
 instance Show CompileError where
+    show BareNone =
+       Data.Text.unpack $
+            _ERROR <> ": ❰None❱ is not valid on its own                                      \n\
+            \                                                                                \n\
+            \Explanation: The conversion to JSON/YAML does not accept ❰None❱ in isolation as \n\
+            \a valid way to represent ❰null❱.  In Dhall, ❰None❱ is a function whose input is \n\
+            \a type and whose output is an ❰Optional❱ of that type.                          \n\
+            \                                                                                \n\
+            \For example:                                                                    \n\
+            \                                                                                \n\
+            \                                                                                \n\
+            \    ┌─────────────────────────────────┐  ❰None❱ is a function whose result is   \n\
+            \    │ None : ∀(a : Type) → Optional a │  an ❰Optional❱ value, but the function  \n\
+            \    └─────────────────────────────────┘  itself is not a valid ❰Optional❱ value \n\
+            \                                                                                \n\
+            \                                                                                \n\
+            \    ┌─────────────────────────────────┐  ❰None Natural❱ is a valid ❰Optional❱   \n\
+            \    │ None Natural : Optional Natural │  value (an absent ❰Natural❱ number in   \n\
+            \    └─────────────────────────────────┘  this case)                             \n\
+            \                                                                                \n\
+            \                                                                                \n\
+            \                                                                                \n\
+            \The conversion to JSON/YAML only translates the fully applied form to ❰null❱.   "
+
+    show (SpecialDouble n) =
+       Data.Text.unpack $
+            _ERROR <> ": " <> special <> " disallowed in JSON                                         \n\
+            \                                                                                \n\
+            \Explanation: The JSON standard does not define a canonical way to encode        \n\
+            \❰NaN❱/❰Infinity❱/❰-Infinity❱.  You can fix this error by either:                \n\
+            \                                                                                \n\
+            \● Using ❰dhall-to-yaml❱ instead of ❰dhall-to-json❱, since YAML does support     \n\
+            \  ❰NaN❱/❰Infinity❱/❰-Infinity❱                                                  \n\
+            \                                                                                \n\
+            \● Enabling the ❰--approximate-special-doubles❱ flag which will encode ❰NaN❱ as  \n\
+            \  ❰null❱, ❰Infinity❱ as the maximum ❰Double❱, and ❰-Infinity❱ as the minimum    \n\
+            \❰Double❱                                                                        \n\
+            \                                                                                \n\
+            \● See if there is a way to remove ❰NaN❱/❰Infinity❱/❰-Infinity❱ from the         \n\
+            \  expression that you are converting to JSON                                    "
+      where
+        special = Data.Text.pack (show n)
+
     show (Unsupported e) =
         Data.Text.unpack $
-            "" <> _ERROR <> ": Cannot translate to JSON                                     \n\
-            \                                                                               \n\
-            \Explanation: Only primitive values, records, unions, ❰List❱s, and ❰Optional❱   \n\
-            \values can be translated from Dhall to JSON                                    \n\
-            \                                                                               \n\
-            \The following Dhall expression could not be translated to JSON:                \n\
-            \                                                                               \n\
-            \↳ " <> txt <> "                                                                "
+            _ERROR <> ": Cannot translate to JSON                                            \n\
+            \                                                                                \n\
+            \Explanation: Only primitive values, records, unions, ❰List❱s, and ❰Optional❱    \n\
+            \values can be translated from Dhall to JSON                                     \n\
+            \                                                                                \n\
+            \The following Dhall expression could not be translated to JSON:                 \n\
+            \                                                                                \n\
+            \↳ " <> txt <> "                                                                 "
       where
         txt = Dhall.Core.pretty e
 
@@ -232,17 +285,16 @@ Right (Object (fromList [("foo",Number 1.0),("bar",String "ABC")]))
 >>> fmap Data.Aeson.encode it
 Right "{\"foo\":1,\"bar\":\"ABC\"}"
 -}
-dhallToJSON :: Expr s X -> Either CompileError Value
+dhallToJSON
+    :: Expr s X
+    -> Either CompileError Value
 dhallToJSON e0 = loop (Dhall.Core.normalize e0)
   where
     loop e = case e of 
         Dhall.Core.BoolLit a -> return (toJSON a)
         Dhall.Core.NaturalLit a -> return (toJSON a)
         Dhall.Core.IntegerLit a -> return (toJSON a)
-        Dhall.Core.DoubleLit a
-          | isInfinite a && a > 0 -> return (toJSON ( 1.7976931348623157e308 :: Double))
-          | isInfinite a && a < 0 -> return (toJSON (-1.7976931348623157e308 :: Double))
-          | otherwise -> return (toJSON a)
+        Dhall.Core.DoubleLit a -> return (toJSON a)
         Dhall.Core.TextLit (Dhall.Core.Chunks [] a) -> do
             return (toJSON a)
         Dhall.Core.ListLit _ a -> do
@@ -256,6 +308,11 @@ dhallToJSON e0 = loop (Dhall.Core.normalize e0)
             return (toJSON a')
         Dhall.Core.App Dhall.Core.None _ -> do
             return Data.Aeson.Null
+        -- Provide a nicer error message for a common user mistake.
+        --
+        -- See: https://github.com/dhall-lang/dhall-lang/issues/492
+        Dhall.Core.None -> do
+            Left BareNone
         Dhall.Core.RecordLit a ->
             case toOrderedList a of
                 [   (   "contents"
@@ -271,7 +328,7 @@ dhallToJSON e0 = loop (Dhall.Core.normalize e0)
                             (Dhall.Core.TextLit
                                 (Dhall.Core.Chunks [] nestedField)
                             )
-                            [ ("Inline", Dhall.Core.Record []) ]
+                            [ ("Inline", Just (Dhall.Core.Record [])) ]
                     )
                  ] -> do
                     contents' <- loop contents
@@ -302,7 +359,7 @@ dhallToJSON e0 = loop (Dhall.Core.normalize e0)
                     ,   Dhall.Core.UnionLit
                             "Inline"
                             (Dhall.Core.RecordLit [])
-                            [ ("Nested", Dhall.Core.Text) ]
+                            [ ("Nested", Just Dhall.Core.Text) ]
                     )
                  ] -> do
                     let contents' =
@@ -321,6 +378,8 @@ dhallToJSON e0 = loop (Dhall.Core.normalize e0)
                     a' <- traverse loop a
                     return (Data.Aeson.toJSON (Dhall.Map.toMap a'))
         Dhall.Core.UnionLit _ b _ -> loop b
+        Dhall.Core.App (Dhall.Core.Field (Dhall.Core.Union _) _) b -> loop b
+        Dhall.Core.Field (Dhall.Core.Union _) k -> return (toJSON k)
         _ -> Left (Unsupported e)
 
 toOrderedList :: Ord k => Map k v -> [(k, v)]
@@ -330,8 +389,9 @@ toOrderedList =
 
 -- | Omit record fields that are @null@
 omitNull :: Value -> Value
-omitNull (Object object) =
-    Object (fmap omitNull (Data.HashMap.Strict.filter (/= Null) object))
+omitNull (Object object) = Object fields
+  where
+    fields =Data.HashMap.Strict.filter (/= Null) (fmap omitNull object)
 omitNull (Array array) =
     Array (fmap omitNull array)
 omitNull (String string) =
@@ -342,6 +402,42 @@ omitNull (Bool bool) =
     Bool bool
 omitNull Null =
     Null
+
+{-| Omit record fields that are @null@, arrays and records whose transitive 
+    fields are all null
+-}
+omitEmpty :: Value -> Value
+omitEmpty (Object object) =
+    if null fields then Null else Object fields
+  where
+    fields = Data.HashMap.Strict.filter (/= Null) (fmap omitEmpty object)
+omitEmpty (Array array) =
+    if null elems then Null else Array elems
+  where
+    elems = (fmap omitEmpty array)
+omitEmpty (String string) =
+    String string
+omitEmpty (Number number) =
+    Number number
+omitEmpty (Bool bool) =
+    Bool bool
+omitEmpty Null =
+    Null
+
+-- | Parser for command-line options related to omitting fields
+parseOmission :: Parser (Value -> Value)
+parseOmission =
+        Options.Applicative.flag'
+            omitNull
+            (   Options.Applicative.long "omitNull"
+            <>  Options.Applicative.help "Omit record fields that are null"
+            )
+    <|> Options.Applicative.flag'
+            omitEmpty
+            (   Options.Applicative.long "omitEmpty"
+            <>  Options.Applicative.help "Omit record fields that are null or empty records"
+            )
+    <|> pure id
 
 {-| Specify whether or not to convert association lists of type
     @List { mapKey: Text, mapValue : v }@ to records
@@ -518,6 +614,9 @@ convertToHomogeneousMaps (Conversion {..}) e0 = loop (Dhall.Core.normalize e0)
             a' = loop a
             b' = loop b
 
+        Dhall.Core.TextShow ->
+            Dhall.Core.TextShow
+
         Dhall.Core.List ->
             Dhall.Core.List
 
@@ -632,13 +731,13 @@ convertToHomogeneousMaps (Conversion {..}) e0 = loop (Dhall.Core.normalize e0)
         Dhall.Core.Union a ->
             Dhall.Core.Union a'
           where
-            a' = fmap loop a
+            a' = fmap (fmap loop) a
 
         Dhall.Core.UnionLit a b c ->
             Dhall.Core.UnionLit a b' c'
           where
-            b' =      loop b
-            c' = fmap loop c
+            b' =            loop  b
+            c' = fmap (fmap loop) c
 
         Dhall.Core.Combine a b ->
             Dhall.Core.Combine a' b'
@@ -665,11 +764,6 @@ convertToHomogeneousMaps (Conversion {..}) e0 = loop (Dhall.Core.normalize e0)
             b' =      loop b
             c' = fmap loop c
 
-        Dhall.Core.Constructors a ->
-            Dhall.Core.Constructors a'
-          where
-            a' = loop a
-
         Dhall.Core.Field a b ->
             Dhall.Core.Field a' b
           where
@@ -694,15 +788,13 @@ convertToHomogeneousMaps (Conversion {..}) e0 = loop (Dhall.Core.normalize e0)
         Dhall.Core.Embed a ->
             Dhall.Core.Embed a
 
+-- | Parser for command-line options related to homogeneous map support
 parseConversion :: Parser Conversion
 parseConversion =
         conversion
     <|> noConversion
   where
-    conversion = do
-        mapKey   <- parseKeyField
-        mapValue <- parseValueField
-        return (Conversion {..})
+    conversion = Conversion <$> parseKeyField <*> parseValueField
       where
         parseKeyField =
             Options.Applicative.strOption
@@ -727,6 +819,55 @@ parseConversion =
             <>  Options.Applicative.help "Disable conversion of association lists to homogeneous maps"
             )
 
+-- | This option specifies how to encode @NaN@\/@Infinity@\/@-Infinity@
+data SpecialDoubleMode
+    = UseYAMLEncoding
+    -- ^ YAML natively supports @NaN@\/@Infinity@\/@-Infinity@
+    | ForbidWithinJSON
+    -- ^ Forbid @NaN@\/@Infinity@\/@-Infinity@ because JSON doesn't support them
+    | ApproximateWithinJSON
+    -- ^ Encode @NaN@\/@Infinity@\/@-Infinity@ as
+    --   @null@\/@1.7976931348623157e308@\/@-1.7976931348623157e308@,
+    --   respectively
+
+{-| Pre-process an expression containing @NaN@\/@Infinity@\/@-Infinity@,
+    handling them as specified according to the `SpecialDoubleMode`
+-}
+handleSpecialDoubles
+    :: SpecialDoubleMode -> Expr s X -> Either CompileError (Expr s X)
+handleSpecialDoubles specialDoubleMode =
+    Control.Lens.rewriteMOf Dhall.Core.subExpressions rewrite
+  where
+    rewrite =
+        case specialDoubleMode of
+            UseYAMLEncoding       -> useYAMLEncoding
+            ForbidWithinJSON      -> forbidWithinJSON
+            ApproximateWithinJSON -> approximateWithinJSON
+
+    useYAMLEncoding (Dhall.Core.DoubleLit n)
+        | isInfinite n && 0 < n =
+            return (Just (Dhall.Core.TextLit (Dhall.Core.Chunks [] "inf")))
+        | isInfinite n && n < 0 =
+            return (Just (Dhall.Core.TextLit (Dhall.Core.Chunks [] "-inf")))
+        | isNaN n =
+            return (Just (Dhall.Core.TextLit (Dhall.Core.Chunks [] "nan")))
+    useYAMLEncoding _ =
+        return Nothing
+
+    forbidWithinJSON (Dhall.Core.DoubleLit n)
+        | isInfinite n || isNaN n =
+            Left (SpecialDouble n)
+    forbidWithinJSON _ =
+        return Nothing
+
+    approximateWithinJSON (Dhall.Core.DoubleLit n)
+        | isInfinite n && n > 0 =
+            return (Just (Dhall.Core.DoubleLit ( 1.7976931348623157e308 :: Double)))
+        | isInfinite n && n < 0 =
+            return (Just (Dhall.Core.DoubleLit (-1.7976931348623157e308 :: Double)))
+        -- Do nothing for @NaN@, which already encodes to @null@
+    approximateWithinJSON _ =
+        return Nothing
 
 {-| Convert a piece of Text carrying a Dhall inscription to an equivalent JSON Value
 
@@ -737,23 +878,53 @@ parseConversion =
 -}
 codeToValue
   :: Conversion
+  -> SpecialDoubleMode
   -> Text  -- ^ Describe the input for the sake of error location.
   -> Text  -- ^ Input text.
   -> IO Value
-codeToValue conversion name code = do
-    parsedExpression <- case Dhall.Parser.exprFromText (Data.Text.unpack name) code of
-      Left  err              -> Control.Exception.throwIO err
-      Right parsedExpression -> return parsedExpression
+codeToValue conversion specialDoubleMode name code = do
+    parsedExpression <- Dhall.Core.throws (Dhall.Parser.exprFromText (Data.Text.unpack name) code)
 
     resolvedExpression <- Dhall.Import.load parsedExpression
 
-    case Dhall.TypeCheck.typeOf resolvedExpression  of
-      Left  err -> Control.Exception.throwIO err
-      Right _   -> return ()
+    _ <- Dhall.Core.throws (Dhall.TypeCheck.typeOf resolvedExpression)
 
     let convertedExpression =
             convertToHomogeneousMaps conversion resolvedExpression
 
-    case dhallToJSON convertedExpression of
+    specialDoubleExpression <- Dhall.Core.throws (handleSpecialDoubles specialDoubleMode convertedExpression)
+
+    case dhallToJSON specialDoubleExpression of
       Left  err  -> Control.Exception.throwIO err
       Right json -> return json
+
+-- | Transform json representation into yaml
+jsonToYaml
+    :: Value
+    -> Bool
+    -> Bool
+    -> Data.ByteString.ByteString
+jsonToYaml json documents quoted = case (documents, json) of
+  (True, Data.Yaml.Array elems)
+    -> Data.ByteString.intercalate "\n---\n"
+       $ fmap (encodeYaml encodeOptions)
+       $ Data.Vector.toList elems
+  _ -> encodeYaml encodeOptions json
+  where
+    encodeYaml = Data.Yaml.encodeWith
+
+    customStyle = \s -> case () of
+        ()
+            | "\n" `Data.Text.isInfixOf` s -> ( noTag, literal )
+            | otherwise -> ( noTag, Text.Libyaml.SingleQuoted )
+        where
+            noTag = Text.Libyaml.NoTag
+            literal = Text.Libyaml.Literal
+
+    quotedOptions = Data.Yaml.setStringStyle
+                        customStyle
+                        Data.Yaml.defaultEncodeOptions
+
+    encodeOptions = if quoted
+        then quotedOptions
+        else Data.Yaml.defaultEncodeOptions

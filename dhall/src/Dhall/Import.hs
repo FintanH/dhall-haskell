@@ -128,7 +128,7 @@ module Dhall.Import (
     ) where
 
 import Control.Applicative (Alternative(..))
-import Codec.CBOR.Term (Term)
+import Codec.CBOR.Term (Term(..))
 import Control.Exception (Exception, SomeException, throwIO, toException)
 import Control.Monad (guard)
 import Control.Monad.Catch (throwM, MonadCatch(catch), catches, Handler(..))
@@ -137,7 +137,7 @@ import Control.Monad.Trans.State.Strict (StateT)
 import Crypto.Hash (SHA256)
 import Data.CaseInsensitive (CI)
 import Data.List.NonEmpty (NonEmpty(..))
-import Data.Semigroup (sconcat, (<>))
+import Data.Semigroup (Semigroup(..))
 import Data.Text (Text)
 #if MIN_VERSION_base(4,8,0)
 #else
@@ -157,8 +157,6 @@ import Dhall.Core
     , ImportType(..)
     , ImportMode(..)
     , Import(..)
-    , ReifiedNormalizer(..)
-    , Scheme(..)
     , URL(..)
     )
 #ifdef MIN_VERSION_http_client
@@ -167,7 +165,7 @@ import Dhall.Import.HTTP
 import Dhall.Import.Types
 import Text.Dot ((.->.), userNodeId)
 
-import Dhall.Parser (Parser(..), ParseError(..), Src(..))
+import Dhall.Parser (Parser(..), ParseError(..), Src(..), SourcedException(..))
 import Dhall.TypeCheck (X(..))
 import Lens.Family.State.Strict (zoom)
 
@@ -190,7 +188,6 @@ import qualified Dhall.Map
 import qualified Dhall.Parser
 import qualified Dhall.Pretty.Internal
 import qualified Dhall.TypeCheck
-import qualified Network.URI.Encode
 import qualified System.Environment
 import qualified System.Directory                 as Directory
 import qualified System.FilePath                  as FilePath
@@ -255,14 +252,16 @@ data Imported e = Imported
 instance Exception e => Exception (Imported e)
 
 instance Show e => Show (Imported e) where
-    show (Imported imports e) =
+    show (Imported canonicalizedImports e) =
            concat (zipWith indent [0..] toDisplay)
         ++ "\n"
         ++ show e
       where
         indent n import_ =
             "\n" ++ replicate (2 * n) ' ' ++ "↳ " ++ Dhall.Pretty.Internal.prettyToString import_
-        canonical = NonEmpty.toList (canonicalizeAll imports)
+
+        canonical = NonEmpty.toList canonicalizedImports
+
         -- Tthe final (outermost) import is fake to establish the base
         -- directory. Also, we need outermost-first.
         toDisplay = drop 1 (reverse canonical)
@@ -278,7 +277,6 @@ instance Show MissingFile where
             "\n"
         <>  "\ESC[1;31mError\ESC[0m: Missing file "
         <>  path
-        <>  "\n"
 
 -- | Exception thrown when an environment variable is missing
 newtype MissingEnvironmentVariable = MissingEnvironmentVariable { name :: Text }
@@ -302,18 +300,15 @@ instance Show MissingImports where
     show (MissingImports []) =
             "\n"
         <>  "\ESC[1;31mError\ESC[0m: No valid imports"
-        <>  "\n"
     show (MissingImports [e]) = show e
     show (MissingImports es) =
             "\n"
         <>  "\ESC[1;31mError\ESC[0m: Failed to resolve imports. Error list:"
         <>  "\n"
         <>  concatMap (\e -> "\n" <> show e <> "\n") es
-        <>  "\n"
 
 throwMissingImport :: (MonadCatch m, Exception e) => e -> m a
-throwMissingImport e = throwM (MissingImports [(toException e)])
-
+throwMissingImport e = throwM (MissingImports [toException e])
 
 -- | Exception thrown when a HTTP url is imported but dhall was built without
 -- the @with-http@ Cabal flag.
@@ -336,15 +331,12 @@ instance Show CannotImportHTTPURL where
         <>  url
         <>  "\n"
 
-canonicalizeAll :: NonEmpty Import -> NonEmpty Import
-canonicalizeAll = NonEmpty.scanr1 step
-  where
-    step a parent = canonicalizeImport (a :| [parent])
-
 {-|
-> canonicalize (canonicalize x) = canonicalize x
+> canonicalize . canonicalize = canonicalize
+
+> canonicalize (a <> b) = canonicalize a <> canonicalize b
 -}
-class Canonicalize path where
+class Semigroup path => Canonicalize path where
     canonicalize :: path -> path
 
 -- |
@@ -394,10 +386,6 @@ instance Canonicalize ImportHashed where
 instance Canonicalize Import where
     canonicalize (Import importHashed importMode) =
         Import (canonicalize importHashed) importMode
-
-canonicalizeImport :: NonEmpty Import -> Import
-canonicalizeImport imports =
-    canonicalize (sconcat (NonEmpty.reverse imports))
 
 toHeaders
   :: Expr s a
@@ -473,6 +461,8 @@ exprFromImport :: Import -> StateT (Status IO) IO (Expr Src Import)
 exprFromImport here@(Import {..}) = do
     let ImportHashed {..} = importHashed
 
+    Status {..} <- State.get
+
     result <- Maybe.runMaybeT $ do
         Just expectedHash <- return hash
         cacheFile         <- getCacheFile expectedHash
@@ -484,13 +474,13 @@ exprFromImport here@(Import {..}) = do
 
         if expectedHash == actualHash
             then return ()
-            else liftIO (Control.Exception.throwIO (HashMismatch {..}))
+            else throwMissingImport (Imported _stack (HashMismatch {..}))
 
         let bytesLazy = Data.ByteString.Lazy.fromStrict bytesStrict
 
-        term <- throws (Codec.Serialise.deserialiseOrFail bytesLazy)
+        term <- Dhall.Core.throws (Codec.Serialise.deserialiseOrFail bytesLazy)
 
-        throws (Dhall.Binary.decodeWithVersion term)
+        Dhall.Core.throws (Dhall.Binary.decodeExpression term)
 
     case result of
         Just expression -> return expression
@@ -518,24 +508,30 @@ exprToImport here expression = do
         Just expectedHash  <- return hash
         cacheFile          <- getCacheFile expectedHash
 
-        _ <- throws (Dhall.TypeCheck.typeWith _startingContext expression)
+        _ <- Dhall.Core.throws (Dhall.TypeCheck.typeWith _startingContext expression)
 
         let normalizedExpression =
                 Dhall.Core.alphaNormalize
                     (Dhall.Core.normalizeWith
-                        (getReifiedNormalizer _normalizer)
+                        _normalizer
                         expression
                     )
 
-        let bytes = encodeExpression _standardVersion normalizedExpression
+        let check version = do
+                let bytes = encodeExpression version normalizedExpression
 
-        let actualHash = Crypto.Hash.hash bytes
+                let actualHash = Crypto.Hash.hash bytes
 
-        if expectedHash == actualHash
-            then return ()
-            else liftIO (Control.Exception.throwIO (HashMismatch {..}))
+                guard (expectedHash == actualHash)
 
-        liftIO (Data.ByteString.writeFile cacheFile bytes)
+                liftIO (Data.ByteString.writeFile cacheFile bytes)
+
+        let fallback = do
+                let actualHash = hashExpression NoVersion normalizedExpression
+
+                throwMissingImport (Imported _stack (HashMismatch {..}))
+
+        Data.Foldable.asum (map check [ minBound .. maxBound ]) <|> fallback
 
     return ()
 
@@ -572,8 +568,6 @@ getCacheFile hash = do
 
     cacheDirectory <- getCacheDirectory
 
-    assertDirectory cacheDirectory
-
     let dhallDirectory = cacheDirectory </> "dhall"
 
     assertDirectory dhallDirectory
@@ -582,22 +576,23 @@ getCacheFile hash = do
 
     return cacheFile
 
-getCacheDirectory :: MonadIO io => io FilePath
-#if MIN_VERSION_directory(1,2,3)
-getCacheDirectory = liftIO (Directory.getXdgDirectory Directory.XdgCache "")
-#else
-getCacheDirectory = liftIO $ do
-    maybeXDGCacheHome <- System.Environment.lookupEnv "XDG_CACHE_HOME"
+getCacheDirectory :: (Alternative m, MonadIO m) => m FilePath
+getCacheDirectory = alternative₀ <|> alternative₁
+  where
+    alternative₀ = do
+        maybeXDGCacheHome <- do
+          liftIO (System.Environment.lookupEnv "XDG_CACHE_HOME")
 
-    case maybeXDGCacheHome of
-        Nothing -> do
-            homeDirectory <- Directory.getHomeDirectory
+        case maybeXDGCacheHome of
+            Just xdgCacheHome -> return xdgCacheHome
+            Nothing           -> empty
 
-            return (homeDirectory </> ".cache")
+    alternative₁ = do
+        maybeHomeDirectory <- liftIO (System.Environment.lookupEnv "HOME")
 
-        Just xdgCacheHome -> do
-            return xdgCacheHome
-#endif
+        case maybeHomeDirectory of
+            Just homeDirectory -> return (homeDirectory </> ".cache")
+            Nothing            -> empty
 
 exprFromUncachedImport :: Import -> StateT (Status IO) IO (Expr Src Import)
 exprFromUncachedImport (Import {..}) = do
@@ -616,28 +611,7 @@ exprFromUncachedImport (Import {..}) = do
 
             return (path, text)
 
-        Remote (URL scheme authority path query fragment maybeHeaders) -> do
-            let prefix =
-                        (case scheme of HTTP -> "http"; HTTPS -> "https")
-                    <>  "://"
-                    <>  authority
-
-            let File {..} = path
-            let Directory {..} = directory
-
-            let pathComponentToText component =
-                    "/" <> Network.URI.Encode.encodeText component
-
-            let fileText =
-                       Text.concat
-                           (map pathComponentToText (reverse components))
-                    <> pathComponentToText file
-
-            let suffix =
-                        (case query    of Nothing -> ""; Just q -> "?" <> q)
-                    <>  (case fragment of Nothing -> ""; Just f -> "#" <> f)
-            let url      = Text.unpack (prefix <> fileText <> suffix)
-
+        Remote url@URL { headers = maybeHeaders } -> do
             mheaders <- case maybeHeaders of
                 Nothing            -> return Nothing
                 Just importHashed_ -> do
@@ -675,7 +649,9 @@ exprFromUncachedImport (Import {..}) = do
 #ifdef MIN_VERSION_http_client
             fetchFromHttpUrl url mheaders
 #else
-            liftIO (throwIO (CannotImportHTTPURL url mheaders))
+            let urlString = Text.unpack (Dhall.Core.pretty url)
+
+            liftIO (throwIO (CannotImportHTTPURL urlString mheaders))
 #endif
 
         Env env -> liftIO $ do
@@ -715,34 +691,38 @@ emptyStatus = emptyStatusWith exprFromImport exprToImport
 -}
 loadWith :: MonadCatch m => Expr Src Import -> StateT (Status m) m (Expr Src X)
 loadWith expr₀ = case expr₀ of
-  Embed import_ -> do
+  Embed import₀ -> do
     Status {..} <- State.get
 
-    let imports = _stack
+    let parent = NonEmpty.head _stack
+
+    let import₁ = parent <> import₀
+
+    let child = canonicalize import₁
 
     let local (Import (ImportHashed _ (Remote  {})) _) = False
         local (Import (ImportHashed _ (Local   {})) _) = True
         local (Import (ImportHashed _ (Env     {})) _) = True
         local (Import (ImportHashed _ (Missing {})) _) = True
 
-    let parent   = canonicalizeImport imports
-    let imports' = NonEmpty.cons import_ imports
-    let here     = canonicalizeImport imports'
+    let referentiallySane = not (local child) || local parent
 
-    if local here && not (local parent)
-        then throwMissingImport (Imported imports (ReferentiallyOpaque import_))
-        else return ()
+    if referentiallySane
+        then return ()
+        else throwMissingImport (Imported _stack (ReferentiallyOpaque import₀))
 
-    expr <- if here `elem` canonicalizeAll imports
-        then throwMissingImport (Imported imports (Cycle import_))
+    let _stack' = NonEmpty.cons child _stack
+
+    expr <- if child `elem` _stack
+        then throwMissingImport (Imported _stack (Cycle import₀))
         else do
-            case Map.lookup here _cache of
-                Just (hereNode, expr) -> do
+            case Map.lookup child _cache of
+                Just (childNode, expr) -> do
                     zoom dot . State.modify $ \getDot -> do
                         parentNode <- getDot
 
-                        -- Add edge between parent and here
-                        parentNode .->. hereNode
+                        -- Add edge between parent and child
+                        parentNode .->. childNode
 
                         -- Return parent NodeId
                         pure parentNode
@@ -764,7 +744,7 @@ loadWith expr₀ = case expr₀ of
                           throwM
                             (MissingImports
                                (map
-                                 (\e -> toException (Imported imports' e))
+                                 (\e -> toException (Imported _stack' e))
                                  es
                                )
                              )
@@ -774,39 +754,39 @@ loadWith expr₀ = case expr₀ of
                             => SomeException
                             -> StateT (Status m) m (Expr Src Import)
                         handler₁ e =
-                          throwMissingImport (Imported imports' e)
+                          throwMissingImport (Imported _stack' e)
 
                     -- This loads a \"dynamic\" expression (i.e. an expression
                     -- that might still contain imports)
-                    let loadDynamic = _resolver here
+                    let loadDynamic = _resolver child
 
                     expr' <- loadDynamic `catches` [ Handler handler₀, Handler handler₁ ]
 
-                    let hereNodeId = userNodeId _nextNodeId
+                    let childNodeId = userNodeId _nextNodeId
 
                     -- Increment the next node id
                     zoom nextNodeId $ State.modify succ
 
                     -- Make current node the dot graph
-                    zoom dot . State.put $ importNode hereNodeId here
+                    zoom dot . State.put $ importNode childNodeId child
 
-                    zoom stack (State.put imports')
+                    zoom stack (State.put _stack')
                     expr'' <- loadWith expr'
-                    zoom stack (State.put imports)
+                    zoom stack (State.put _stack)
 
                     zoom dot . State.modify $ \getSubDot -> do
                         parentNode <- _dot
 
                         -- Get current node back from sub-graph
-                        hereNode <- getSubDot
+                        childNode <- getSubDot
 
-                        -- Add edge between parent and here
-                        parentNode .->. hereNode
+                        -- Add edge between parent and child
+                        parentNode .->. childNode
 
                         -- Return parent NodeId
                         pure parentNode
 
-                    _cacher here expr''
+                    _cacher child expr''
 
                     -- Type-check expressions here for three separate reasons:
                     --
@@ -819,30 +799,40 @@ loadWith expr₀ = case expr₀ of
                     -- There is no need to check expressions that have been
                     -- cached, since they have already been checked
                     expr''' <- case Dhall.TypeCheck.typeWith _startingContext expr'' of
-                        Left  err -> throwM (Imported imports' err)
-                        Right _   -> return (Dhall.Core.normalizeWith (getReifiedNormalizer _normalizer) expr'')
-                    zoom cache (State.modify' (Map.insert here (hereNodeId, expr''')))
+                        Left  err -> throwM (Imported _stack' err)
+                        Right _   -> return (Dhall.Core.normalizeWith _normalizer expr'')
+                    zoom cache (State.modify' (Map.insert child (childNodeId, expr''')))
                     return expr'''
 
-    case hash (importHashed import_) of
+    case hash (importHashed import₀) of
         Nothing -> do
             return ()
         Just expectedHash -> do
-            let actualHash =
-                    hashExpression _standardVersion (Dhall.Core.alphaNormalize expr)
+            let matches version =
+                    let actualHash =
+                            hashExpression version (Dhall.Core.alphaNormalize expr)
 
-            if expectedHash == actualHash
+                    in  expectedHash == actualHash
+
+            if any matches [ minBound .. maxBound ]
                 then return ()
-                else throwMissingImport (Imported imports' (HashMismatch {..}))
+                else do
+                    let actualHash =
+                            hashExpression NoVersion (Dhall.Core.alphaNormalize expr)
+
+                    throwMissingImport (Imported _stack' (HashMismatch {..}))
 
     return expr
   ImportAlt a b -> loadWith a `catch` handler₀
     where
-      handler₀ (MissingImports es₀) =
-        loadWith b `catch` handler₁
+      handler₀ (SourcedException (Src begin _ text₀) (MissingImports es₀)) =
+          loadWith b `catch` handler₁
         where
-          handler₁ (MissingImports es₁) =
-            throwM (MissingImports (es₀ ++ es₁))
+          handler₁ (SourcedException (Src _ end text₁) (MissingImports es₁)) =
+              throwM (SourcedException (Src begin end text₂) (MissingImports (es₀ ++ es₁)))
+            where
+              text₂ = text₀ <> " ? " <> text₁
+
   Const a              -> pure (Const a)
   Var a                -> pure (Var a)
   Lam a b c            -> Lam <$> pure a <*> loadWith b <*> loadWith c
@@ -880,6 +870,7 @@ loadWith expr₀ = case expr₀ of
   Text                 -> pure Text
   TextLit (Chunks a b) -> fmap TextLit (Chunks <$> mapM (mapM loadWith) a <*> pure b)
   TextAppend a b       -> TextAppend <$> loadWith a <*> loadWith b
+  TextShow             -> pure TextShow
   List                 -> pure List
   ListLit a b          -> ListLit <$> mapM loadWith a <*> mapM loadWith b
   ListAppend a b       -> ListAppend <$> loadWith a <*> loadWith b
@@ -898,40 +889,52 @@ loadWith expr₀ = case expr₀ of
   OptionalBuild        -> pure OptionalBuild
   Record a             -> Record <$> mapM loadWith a
   RecordLit a          -> RecordLit <$> mapM loadWith a
-  Union a              -> Union <$> mapM loadWith a
-  UnionLit a b c       -> UnionLit <$> pure a <*> loadWith b <*> mapM loadWith c
+  Union a              -> Union <$> mapM (mapM loadWith) a
+  UnionLit a b c       -> UnionLit <$> pure a <*> loadWith b <*> mapM (mapM loadWith) c
   Combine a b          -> Combine <$> loadWith a <*> loadWith b
   CombineTypes a b     -> CombineTypes <$> loadWith a <*> loadWith b
   Prefer a b           -> Prefer <$> loadWith a <*> loadWith b
   Merge a b c          -> Merge <$> loadWith a <*> loadWith b <*> mapM loadWith c
-  Constructors a       -> Constructors <$> loadWith a
   Field a b            -> Field <$> loadWith a <*> pure b
   Project a b          -> Project <$> loadWith a <*> pure b
-  Note a b             -> Note <$> pure a <*> loadWith b
+  Note a b             -> do
+      let handler e = throwM (SourcedException a (e :: MissingImports))
+
+      (Note <$> pure a <*> loadWith b) `catch` handler
 
 -- | Resolve all imports within an expression
 load :: Expr Src Import -> IO (Expr Src X)
 load expression = State.evalStateT (loadWith expression) (emptyStatus ".")
 
 encodeExpression
-    :: forall s . StandardVersion -> Expr s X -> Data.ByteString.ByteString
+    :: forall s
+    .  StandardVersion
+    -- ^ `Nothing` means to encode without the version tag
+    -> Expr s X
+    -> Data.ByteString.ByteString
 encodeExpression _standardVersion expression = bytesStrict
   where
     intermediateExpression :: Expr s Import
     intermediateExpression = fmap absurd expression
 
     term :: Term
-    term =
-        Dhall.Binary.encodeWithVersion
-            _standardVersion
-            intermediateExpression
+    term = Dhall.Binary.encode intermediateExpression
 
-    bytesLazy = Codec.Serialise.serialise term
+    taggedTerm :: Term
+    taggedTerm =
+        case _standardVersion of
+            NoVersion -> term
+            s         -> TList [ TString v, term ]
+              where
+                v = Dhall.Binary.renderStandardVersion s
+
+    bytesLazy = Codec.Serialise.serialise taggedTerm
 
     bytesStrict = Data.ByteString.Lazy.toStrict bytesLazy
 
 -- | Hash a fully resolved expression
-hashExpression :: StandardVersion -> Expr s X -> (Crypto.Hash.Digest SHA256)
+hashExpression
+    :: StandardVersion -> Expr s X -> (Crypto.Hash.Digest SHA256)
 hashExpression _standardVersion expression =
     Crypto.Hash.hash (encodeExpression _standardVersion expression)
 
@@ -954,8 +957,4 @@ instance Show ImportResolutionDisabled where
 -- | Assert than an expression is import-free
 assertNoImports :: MonadIO io => Expr Src Import -> io (Expr Src X)
 assertNoImports expression =
-    throws (traverse (\_ -> Left ImportResolutionDisabled) expression)
-
-throws :: (Exception e, MonadIO io) => Either e a -> io a
-throws (Left  e) = liftIO (Control.Exception.throwIO e)
-throws (Right a) = return a
+    Dhall.Core.throws (traverse (\_ -> Left ImportResolutionDisabled) expression)

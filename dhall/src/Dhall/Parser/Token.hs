@@ -6,8 +6,10 @@ module Dhall.Parser.Token (
     whitespace,
     bashEnvironmentVariable,
     posixEnvironmentVariable,
+    ComponentType(..),
     file_,
     label,
+    anyLabel,
     labels,
     httpRaw,
     hexdig,
@@ -53,6 +55,7 @@ module Dhall.Parser.Token (
     _Integer,
     _Double,
     _Text,
+    _TextShow,
     _List,
     _True,
     _False,
@@ -109,7 +112,9 @@ import qualified Data.HashSet
 import qualified Data.List.NonEmpty
 import qualified Data.Text
 import qualified Dhall.Set
+import qualified Network.URI.Encode         as URI.Encode
 import qualified Text.Megaparsec
+import qualified Text.Megaparsec.Char.Lexer
 import qualified Text.Parser.Char
 import qualified Text.Parser.Combinators
 
@@ -159,13 +164,15 @@ doubleInfinity = (do
 integerLiteral :: Parser Integer
 integerLiteral = (do
     sign <- signPrefix
-    a <- Text.Parser.Token.natural
+    a <- Text.Megaparsec.Char.Lexer.decimal
+    whitespace
     return (sign a) ) <?> "integer literal"
 
 naturalLiteral :: Parser Natural
 naturalLiteral = (do
-    a <- Text.Parser.Token.natural
-    return (fromIntegral a) ) <?> "natural literal"
+    a <- Text.Megaparsec.Char.Lexer.decimal
+    whitespace
+    return a ) <?> "natural literal"
 
 identifier :: Parser Var
 identifier = do
@@ -173,7 +180,9 @@ identifier = do
 
     let indexed = do
             _ <- Text.Parser.Char.char '@'
-            Text.Parser.Token.natural
+            n <- Text.Megaparsec.Char.Lexer.decimal
+            whitespace
+            return n
 
     n <- indexed <|> pure 0
     return (V x n)
@@ -262,12 +271,12 @@ blockCommentContinue = endOfComment <|> continue
         blockCommentChunk
         blockCommentContinue
 
-simpleLabel :: Parser Text
-simpleLabel = try (do
+simpleLabel :: Bool -> Parser Text
+simpleLabel allowReserved = try (do
     c    <- Text.Parser.Char.satisfy headCharacter
     rest <- Dhall.Parser.Combinators.takeWhile tailCharacter
     let text = Data.Text.cons c rest
-    Control.Monad.guard (not (Data.HashSet.member text reservedIdentifiers))
+    Control.Monad.guard (allowReserved || not (Data.HashSet.member text reservedIdentifiers))
     return text )
   where
     headCharacter c = alpha c || c == '_'
@@ -281,7 +290,9 @@ backtickLabel = do
     _ <- Text.Parser.Char.char '`'
     return t
   where
-    predicate c = alpha c || digit c || elem c ("$-/_:." :: String)
+    predicate c =
+            '\x20' <= c && c <= '\x5F'
+        ||  '\x61' <= c && c <= '\x7E'
 
 labels :: Parser (Set Text)
 labels = do
@@ -293,16 +304,22 @@ labels = do
     emptyLabels = pure Dhall.Set.empty
 
     nonEmptyLabels = do
-        x  <- label
-        xs <- many (do _ <- _comma; label)
+        x  <- anyLabel
+        xs <- many (do _ <- _comma; anyLabel)
         noDuplicates (x : xs)
 
 
 label :: Parser Text
 label = (do
-    t <- backtickLabel <|> simpleLabel
+    t <- backtickLabel <|> simpleLabel False
     whitespace
     return t ) <?> "label"
+
+anyLabel :: Parser Text
+anyLabel = (do
+    t <- backtickLabel <|> simpleLabel True
+    whitespace
+    return t ) <?> "any label"
 
 bashEnvironmentVariable :: Parser Text
 bashEnvironmentVariable = satisfy predicate0 <> star (satisfy predicate1)
@@ -316,9 +333,24 @@ posixEnvironmentVariable = plus posixEnvironmentVariableCharacter
 
 posixEnvironmentVariableCharacter :: Parser Text
 posixEnvironmentVariableCharacter =
-    ("\\" <> satisfy predicate0) <|> satisfy predicate1
+    escapeCharacter <|> satisfy predicate1
   where
-    predicate0 c = c `elem` ("\"\\abfnrtv" :: String)
+    escapeCharacter = do
+        _ <- Text.Parser.Char.char '\\'
+
+        c <- Text.Parser.Char.satisfy (`elem` ("\"\\abfnrtv" :: String))
+
+        case c of
+            '"'  -> return "\""
+            '\\' -> return "\\"
+            'a'  -> return "\a"
+            'b'  -> return "\b"
+            'f'  -> return "\f"
+            'n'  -> return "\n"
+            'r'  -> return "\r"
+            't'  -> return "\t"
+            'v'  -> return "\v"
+            _    -> empty
 
     predicate1 c =
             ('\x20' <= c && c <= '\x21')
@@ -330,25 +362,33 @@ quotedPathCharacter :: Char -> Bool
 quotedPathCharacter c =
         ('\x20' <= c && c <= '\x21')
     ||  ('\x23' <= c && c <= '\x2E')
-    ||  ('\x30' <= c && c <= '\x7E')
+    ||  ('\x30' <= c && c <= '\x10FFFF')
 
-pathComponent :: Parser Text
-pathComponent = do
-    _      <- "/" :: Parser Text
+data ComponentType = URLComponent | FileComponent
 
-    let pathData = Text.Megaparsec.takeWhile1P Nothing Dhall.Core.pathCharacter
+pathComponent :: ComponentType -> Parser Text
+pathComponent componentType = do
+    _ <- "/" :: Parser Text
+
+    let pathData = do
+            text <- Text.Megaparsec.takeWhile1P Nothing Dhall.Core.pathCharacter
+
+            case componentType of
+                FileComponent -> return text
+                URLComponent  -> return (URI.Encode.decodeText text)
 
     let quotedPathData = do
             _    <- Text.Parser.Char.char '"'
             text <- Text.Megaparsec.takeWhile1P Nothing quotedPathCharacter
             _    <- Text.Parser.Char.char '"'
+
             return text
 
     pathData <|> quotedPathData
 
-file_ :: Parser File
-file_ = do
-    path <- Data.List.NonEmpty.some1 pathComponent
+file_ :: ComponentType -> Parser File
+file_ componentType = do
+    path <- Data.List.NonEmpty.some1 (pathComponent componentType)
 
     let directory = Directory (reverse (Data.List.NonEmpty.init path))
     let file      = Data.List.NonEmpty.last path
@@ -365,9 +405,8 @@ httpRaw :: Parser URL
 httpRaw = do
     scheme    <- scheme_
     authority <- authority_
-    path      <- file_
+    path      <- file_ URLComponent
     query     <- optional (("?" :: Parser Text) *> query_)
-    fragment  <- optional (("#" :: Parser Text) *> fragment_)
 
     let headers = Nothing
 
@@ -416,28 +455,32 @@ ipV6Address =
     alternative2 = option h16 <> "::" <> count 4 (h16 <> ":") <> ls32
 
     alternative3 =
-            option (range 0 1 (h16 <> ":") <> h16)
+            option (h16 <> range 0 1 (try (":" <> h16)))
         <>  "::"
         <>  count 3 (h16 <> ":")
         <>  ls32
 
     alternative4 =
-            option (range 0 2 (h16 <> ":") <> h16)
+            option (h16 <> range 0 2 (try (":" <> h16)))
         <>  "::"
         <>  count 2 (h16 <> ":")
         <>  ls32
 
     alternative5 =
-        option (range 0 3 (h16 <> ":") <> h16) <> "::" <> h16 <> ":" <> ls32
+            option (h16 <> range 0 3 (try (":" <> h16)))
+        <>  "::"
+        <>  h16
+        <>  ":"
+        <>  ls32
 
     alternative6 =
-        option (range 0 4 (h16 <> ":") <> h16) <> "::" <> ls32
+        option (h16 <> range 0 4 (try (":" <> h16))) <> "::" <> ls32
 
     alternative7 =
-        option (range 0 5 (h16 <> ":") <> h16) <> "::" <> h16
+        option (h16 <> range 0 5 (try (":" <> h16))) <> "::" <> h16
 
     alternative8 =
-        option (range 0 6 (h16 <> ":") <> h16) <> "::"
+        option (h16 <> range 0 6 (try (":" <> h16))) <> "::"
 
 h16 :: Parser Text
 h16 = range 1 3 (satisfy hexdig)
@@ -486,11 +529,6 @@ pchar = satisfy predicate <|> pctEncoded
 
 query_ :: Parser Text
 query_ = star (pchar <|> satisfy predicate)
-  where
-    predicate c = c == '/' || c == '?'
-
-fragment_ :: Parser Text
-fragment_ = star (pchar <|> satisfy predicate)
   where
     predicate c = c == '/' || c == '?'
 
@@ -620,6 +658,9 @@ _Double = reserved "Double"
 
 _Text :: Parser ()
 _Text = reserved "Text"
+
+_TextShow :: Parser ()
+_TextShow = reserved "Text/show"
 
 _List :: Parser ()
 _List = reserved "List"

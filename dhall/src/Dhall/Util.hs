@@ -5,11 +5,14 @@
 module Dhall.Util
     ( snip
     , snipDoc
+    , insert
+    , _ERROR
     ) where
 
 import Data.Monoid ((<>))
+import Data.String (IsString)
 import Data.Text (Text)
-import Data.Text.Prettyprint.Doc (Doc)
+import Data.Text.Prettyprint.Doc (Doc, Pretty)
 import Dhall.Pretty (Ann)
 
 import qualified Data.Text
@@ -20,15 +23,17 @@ import qualified Dhall.Pretty
 -- | Utility function to cut out the interior of a large text block
 snip :: Text -> Text
 snip text
-    | length ls <= 7 = text
+    | length ls <= numberOfLinesOfContext * 2 + 1 = text
     | otherwise =
          if Data.Text.last text == '\n' then preview else Data.Text.init preview
   where
+    numberOfLinesOfContext = 20
+
     ls = Data.Text.lines text
 
-    header = take 3 ls
+    header = take numberOfLinesOfContext ls
 
-    footer = takeEnd 3 ls
+    footer = takeEnd numberOfLinesOfContext ls
 
     excerpt = filter (Data.Text.any (/= ' ')) (header <> footer)
 
@@ -67,3 +72,12 @@ takeEnd n l = go (drop n l) l
   where
     go (_:xs) (_:ys) = go xs ys
     go _ r = r
+
+-- | Function to insert an aligned pretty expression
+insert :: Pretty a => a -> Doc Ann
+insert expression =
+    "↳ " <> Pretty.align (snipDoc (Pretty.pretty expression))
+
+-- | Prefix used for error messages
+_ERROR :: IsString string => string
+_ERROR = "\ESC[1;31mError\ESC[0m"

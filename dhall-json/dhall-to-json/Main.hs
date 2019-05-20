@@ -1,4 +1,3 @@
-{-# LANGUAGE ApplicativeDo     #-}
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -7,9 +6,10 @@ module Main where
 import Control.Applicative ((<|>))
 import Control.Exception (SomeException)
 import Control.Monad (when)
+import Data.Aeson (Value)
 import Data.Monoid ((<>))
 import Data.Version (showVersion)
-import Dhall.JSON (Conversion)
+import Dhall.JSON (Conversion, SpecialDoubleMode(..))
 import Options.Applicative (Parser, ParserInfo)
 
 import qualified Control.Exception
@@ -27,21 +27,23 @@ import qualified System.Exit
 import qualified System.IO
 
 data Options = Options
-    { explain    :: Bool
-    , pretty     :: Bool
-    , omitNull   :: Bool
-    , version    :: Bool
-    , conversion :: Conversion
+    { explain                   :: Bool
+    , pretty                    :: Bool
+    , omission                  :: Value -> Value
+    , version                   :: Bool
+    , conversion                :: Conversion
+    , approximateSpecialDoubles :: Bool
     }
 
 parseOptions :: Parser Options
-parseOptions = Options.Applicative.helper <*> do
-    explain    <- parseExplain
-    pretty     <- parsePretty
-    omitNull   <- parseOmitNull
-    version    <- parseVersion
-    conversion <- Dhall.JSON.parseConversion
-    return (Options {..})
+parseOptions =
+        Options
+    <$> parseExplain
+    <*> parsePretty
+    <*> Dhall.JSON.parseOmission
+    <*> parseVersion
+    <*> Dhall.JSON.parseConversion
+    <*> parseApproximateSpecialDoubles
   where
     parseExplain =
         Options.Applicative.switch
@@ -69,22 +71,22 @@ parseOptions = Options.Applicative.helper <*> do
         defaultBehavior =
             pure False
 
-    parseOmitNull =
-        Options.Applicative.switch
-            (   Options.Applicative.long "omitNull"
-            <>  Options.Applicative.help "Omit record fields that are null"
-            )
-
     parseVersion =
         Options.Applicative.switch
             (   Options.Applicative.long "version"
             <>  Options.Applicative.help "Display version"
             )
 
+    parseApproximateSpecialDoubles =
+        Options.Applicative.switch
+            (   Options.Applicative.long "approximate-special-doubles"
+            <>  Options.Applicative.help "Use approximate representation for NaN/±Infinity"
+            )
+
 parserInfo :: ParserInfo Options
 parserInfo =
     Options.Applicative.info
-        parseOptions
+        (Options.Applicative.helper <*> parseOptions)
         (   Options.Applicative.fullDesc
         <>  Options.Applicative.progDesc "Compile Dhall to JSON"
         )
@@ -112,11 +114,14 @@ main = do
 
         let explaining = if explain then Dhall.detailed else id
 
-        let omittingNull = if omitNull then Dhall.JSON.omitNull else id
+        let specialDoubleMode =
+                if approximateSpecialDoubles
+                then ApproximateWithinJSON
+                else ForbidWithinJSON
 
         stdin <- Data.Text.IO.getContents
 
-        json <- omittingNull <$> explaining (Dhall.JSON.codeToValue conversion "(stdin)" stdin)
+        json <- omission <$> explaining (Dhall.JSON.codeToValue conversion specialDoubleMode "(stdin)" stdin)
 
         Data.ByteString.Char8.putStrLn $ Data.ByteString.Lazy.toStrict $ encode json
 

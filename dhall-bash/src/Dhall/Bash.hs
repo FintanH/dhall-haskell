@@ -264,6 +264,10 @@ dhallToStatement expr0 var0 = go (Dhall.Core.normalize expr0)
                 <>  Data.ByteString.intercalate " " kvs'
                 <>  ")"
         return bytes
+    go (Field (Union m) k) = do
+        e <- first adapt (dhallToExpression (Field (Union m) k))
+        let bytes = "declare -r " <> var <> "=" <> e
+        return bytes
     go (Embed   x) = do
         Dhall.TypeCheck.absurd x
     go (Note  _ e) = do
@@ -302,6 +306,7 @@ dhallToStatement expr0 var0 = go (Dhall.Core.normalize expr0)
     go e@(DoubleShow      ) = Left (UnsupportedStatement e)
     go e@(Text            ) = Left (UnsupportedStatement e)
     go e@(TextAppend    {}) = Left (UnsupportedStatement e)
+    go e@(TextShow      {}) = Left (UnsupportedStatement e)
     go e@(List            ) = Left (UnsupportedStatement e)
     go e@(ListAppend    {}) = Left (UnsupportedStatement e)
     go e@(ListBuild       ) = Left (UnsupportedStatement e)
@@ -323,7 +328,6 @@ dhallToStatement expr0 var0 = go (Dhall.Core.normalize expr0)
     go e@(CombineTypes  {}) = Left (UnsupportedStatement e)
     go e@(Prefer        {}) = Left (UnsupportedStatement e)
     go e@(Merge         {}) = Left (UnsupportedStatement e)
-    go e@(Constructors  {}) = Left (UnsupportedStatement e)
     go e@(Field         {}) = Left (UnsupportedStatement e)
     go e@(Project       {}) = Left (UnsupportedStatement e)
     go e@(ImportAlt     {}) = Left (UnsupportedStatement e)
@@ -353,4 +357,8 @@ dhallToExpression expr0 = go (Dhall.Core.normalize expr0)
     go (TextLit (Chunks [] a)) = do
         let bytes = Data.Text.Encoding.encodeUtf8 a
         return (Text.ShellEscape.bytes (Text.ShellEscape.bash bytes))
+    go e@(Field (Union m) k) =
+        case Dhall.Map.lookup k m of
+            Just Nothing -> go (TextLit (Chunks [] k))
+            _            -> Left (UnsupportedExpression e)
     go e = Left (UnsupportedExpression e)

@@ -27,6 +27,7 @@ import Data.String (IsString(..))
 import Data.Text (Text)
 import Data.Text.Prettyprint.Doc (Doc, Pretty)
 import Dhall.Core (Binding(..), Chunks (..), Const(..), Expr(..), Var(..))
+import Dhall.Binary (ToTerm)
 import Dhall.Map (Map)
 import Dhall.Set (Set)
 import Dhall.Pretty.Internal (Ann)
@@ -153,7 +154,7 @@ rparen :: Diff
 rparen = token Internal.rparen
 
 -- | Render the difference between the normal form of two expressions
-diffNormalized :: (Eq a, Pretty a) => Expr s a -> Expr s a -> Doc Ann
+diffNormalized :: (Eq a, Pretty a, ToTerm a) => Expr s a -> Expr s a -> Doc Ann
 diffNormalized l0 r0 = Dhall.Diff.diff l1 r1
   where
     l1 = Dhall.Core.alphaNormalize (Dhall.Core.normalize l0)
@@ -255,7 +256,15 @@ diffKeyVals
     -> Map Text (Expr s a)
     -> Map Text (Expr s a)
     -> [Diff]
-diffKeyVals assign kvsL kvsR =
+diffKeyVals assign = diffKeysWith assign diffExpression
+
+diffKeysWith
+    :: Diff
+    -> (a -> a -> Diff)
+    -> Map Text a
+    -> Map Text a
+    -> [Diff]
+diffKeysWith assign diffVals kvsL kvsR =
     diffFieldNames <> diffFieldValues <> (if anyEqual then [ ignore ] else [])
   where
     ksL = Data.Set.fromList (Dhall.Map.keys kvsL)
@@ -274,7 +283,7 @@ diffKeyVals assign kvsL kvsR =
             <>  ignore
             ]
 
-    shared = Dhall.Map.intersectionWith diffExpression kvsL kvsR
+    shared = Dhall.Map.intersectionWith diffVals kvsL kvsR
 
     diffFieldValues =
         filter (not . same) (Dhall.Map.foldMapWithKey adapt shared)
@@ -405,8 +414,10 @@ diffRecordLit kvsL kvsR = braced (diffKeyVals equals kvsL kvsR)
 
 diffUnion
     :: (Eq a, Pretty a)
-    => Map Text (Expr s a) -> Map Text (Expr s a) -> Diff
-diffUnion kvsL kvsR = angled (diffKeyVals colon kvsL kvsR)
+    => Map Text (Maybe (Expr s a)) -> Map Text (Maybe (Expr s a)) -> Diff
+diffUnion kvsL kvsR = angled (diffKeysWith colon diffVals kvsL kvsR)
+  where
+    diffVals = diffMaybe (colon <> " ") diffExpression
 
 diffUnionLit
     :: (Eq a, Pretty a)
@@ -414,8 +425,8 @@ diffUnionLit
     -> Text
     -> Expr s a
     -> Expr s a
-    -> Map Text (Expr s a)
-    -> Map Text (Expr s a)
+    -> Map Text (Maybe (Expr s a))
+    -> Map Text (Maybe (Expr s a))
     -> Diff
 diffUnionLit kL kR vL vR kvsL kvsR =
         langle
@@ -424,8 +435,10 @@ diffUnionLit kL kR vL vR kvsL kvsR =
     <>  equals
     <>  " "
     <>  format " " (diffExpression vL vR)
-    <>  halfAngled (diffKeyVals equals kvsL kvsR)
+    <>  halfAngled (diffKeysWith colon diffVals kvsL kvsR)
   where
+    diffVals = diffMaybe (colon <> " ") diffExpression
+
     halfAngled = enclosed (pipe <> " ") (pipe <> " ") rangle
 
 listSkeleton :: Diff
@@ -640,10 +653,6 @@ skeleton (Merge {}) =
         keyword "merge"
     <>  " "
     <>  ignore
-    <>  " "
-    <>  ignore
-skeleton (Constructors {}) =
-        keyword "constructors"
     <>  " "
     <>  ignore
 skeleton (Field {}) =
@@ -974,12 +983,6 @@ diffApplicationExpression l@(App {}) r@(App {}) =
   where
     docs (App aL bL) (App aR bR) =
         Data.List.NonEmpty.cons (diffImportExpression bL bR) (docs aL aR)
-    docs (Constructors aL) (Constructors aR) =
-        diffImportExpression aL aR :| [ keyword "constructors" ]
-    docs aL aR@(Constructors {}) =
-        pure (mismatch aL aR)
-    docs aL@(Constructors {}) aR =
-        pure (mismatch aL aR)
     docs (Some aL) (Some aR) =
         diffImportExpression aL aR :| [ builtin "Some" ]
     docs aL aR@(Some {}) =
@@ -991,12 +994,6 @@ diffApplicationExpression l@(App {}) r@(App {}) =
 diffApplicationExpression l@(App {}) r =
     mismatch l r
 diffApplicationExpression l r@(App {}) =
-    mismatch l r
-diffApplicationExpression (Constructors l) (Constructors r) =
-    enclosed' mempty mempty (keyword "constructors" :| [ diffImportExpression l r ])
-diffApplicationExpression l@(Constructors {}) r =
-    mismatch l r
-diffApplicationExpression l r@(Constructors {}) =
     mismatch l r
 diffApplicationExpression (Some l) (Some r) =
     enclosed' mempty mempty (builtin "Some" :| [ diffImportExpression l r ])
@@ -1149,6 +1146,12 @@ diffPrimitiveExpression Text Text =
 diffPrimitiveExpression l@Text r =
     mismatch l r
 diffPrimitiveExpression l r@Text =
+    mismatch l r
+diffPrimitiveExpression TextShow TextShow =
+    "…"
+diffPrimitiveExpression l@TextShow r =
+    mismatch l r
+diffPrimitiveExpression l r@TextShow =
     mismatch l r
 diffPrimitiveExpression List List =
     "…"

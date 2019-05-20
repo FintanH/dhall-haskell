@@ -1,4 +1,4 @@
-{ compiler ? "ghc843", coverage ? false }:
+{ compiler ? "ghc843", coverage ? false, system ? builtins.currentSystem }:
 
 let
   fetchNixpkgs = import ./fetchNixpkgs.nix;
@@ -15,14 +15,80 @@ let
       builtins.listToAttrs (map toNameValue names);
 
   overlayShared = pkgsNew: pkgsOld: {
-    twitterBootstrap = pkgsNew.callPackage ./twitterBootstrap.nix { };
+    logo = {
+      bash =
+        pkgsNew.fetchurl {
+          url    = "https://raw.githubusercontent.com/odb/official-bash-logo/master/assets/Logos/Icons/PNG/128x128.png";
+          sha256 = "0fybbp6hbqrfw80fbk55bnykzda0m7x4vk38i80bjlmfbrkfvild";
+        };
 
-    dhall-logo =
-      pkgsNew.fetchurl {
-        url = "https://raw.githubusercontent.com/dhall-lang/dhall-lang/8bab26f9515cc1007025e0ab4b4e7dd6e95a7103/img/dhall-logo.png";
+      clojure =
+        pkgsNew.fetchurl {
+          url    = "https://upload.wikimedia.org/wikipedia/commons/5/5d/Clojure_logo.svg";
+          sha256 = "0mrjzv690g9mxljzxsvay8asyr8vlxhhs9smmax7mp3psd49b43g";
+        };
 
-        sha256 = "0j6sfvm4kxqb2m6s1sv9qag7m30cibaxpphprhaibp9s9shpra4p";
-      };
+      ruby =
+        pkgsNew.fetchurl {
+          url    = "https://upload.wikimedia.org/wikipedia/commons/7/73/Ruby_logo.svg";
+          sha256 = "1yvvdqcmgpa75y7px3isi4x6690iksq52ilnbslhn7mcngikw6m9";
+        };
+
+      dhallLarge =
+        pkgsNew.fetchurl {
+          url    = "https://raw.githubusercontent.com/dhall-lang/dhall-lang/8bab26f9515cc1007025e0ab4b4e7dd6e95a7103/img/dhall-logo.png";
+          sha256 = "0j6sfvm4kxqb2m6s1sv9qag7m30cibaxpphprhaibp9s9shpra4p";
+        };
+
+      dhallSmall =
+        pkgsNew.fetchurl {
+          url    = "https://raw.githubusercontent.com/dhall-lang/dhall-lang/8bab26f9515cc1007025e0ab4b4e7dd6e95a7103/img/dhall-icon.png";
+          sha256 = "1lly3yb5szl9n3hszsfzv2mil98cvlidrzyci7vs4wi461s9bhxi";
+        };
+
+      discourse = ./img/discourse.svg;
+
+      github = pkgsNew.callPackage ./githubLogo.nix { };
+
+      haskell =
+        pkgsNew.fetchurl {
+          url    = "https://wiki.haskell.org/wikiupload/4/4a/HaskellLogoStyPreview-1.png";
+          sha256 = "0g26j7vx34m46mwp93qgg3q5x8pfdq2j1ch0vxz5gj0nk3b8fxda";
+        };
+
+      kubernetes =
+        pkgsNew.fetchurl {
+          url    = "https://raw.githubusercontent.com/kubernetes/kubernetes/7839fe38620508eb0651930cb0e1acb8ea367842/logo/logo.svg";
+          sha256 = "0kp6idffg9k52ycgv5zkg9n08pfldzsy0fzhwsrb2f7cvrl6fpw4";
+        };
+
+      nix =
+        pkgsNew.fetchurl {
+          url    = "https://nixos.org/logo/nix-wiki.png";
+          sha256 = "1hrz7wr7i0b2bips60ygacbkmdzv466lsbxi22hycg42kv4m0173";
+        };
+
+      json =
+        pkgsNew.fetchurl {
+          url    = "https://upload.wikimedia.org/wikipedia/commons/c/c9/JSON_vector_logo.svg";
+          sha256 = "1hqd1qh35v9magjp3rbsw8wszk2wn3hkz981ir49z5cyf11jnx95";
+        };
+
+      stackOverflow =
+        pkgsNew.fetchurl {
+          url    = "https://cdn.sstatic.net/Sites/stackoverflow/company/img/logos/so/so-icon.svg";
+          sha256 = "0i84h23ax197f3hwh0hqm6yjvvnpcjyhd6nkyy33z6x10dh8v4z3";
+        };
+
+
+      twitter = pkgsNew.callPackage ./twitterLogo.nix { };
+
+      yaml =
+        pkgsNew.fetchurl {
+          url    = "https://raw.githubusercontent.com/yaml/yaml-spec/a6f764e13de58d5f753877f588a01b35dc9a5168/logo.png";
+          sha256 = "12grgaxpqi755p2rnvw3x02zc69brpnzx208id1f0z42w387j4hi";
+        };
+    };
 
     dhall-sdist =
       let
@@ -72,29 +138,22 @@ let
                   then drv
                   else pkgsNew.haskell.lib.failOnAllWarnings drv;
 
-                dontCheckExtension =
-                  mass pkgsNew.haskell.lib.dontCheck [
-                    "aeson"
-                    "base-compat-batteries"
-                    "comonad"
-                    "conduit"
-                    "distributive"
-                    "doctest"
-                    "Glob"
-                    "half"
-                    "http-types"
-                    "megaparsec"
-                    "prettyprinter"
-                    "prettyprinter-ansi-terminal"
-                    # https://github.com/well-typed/cborg/issues/172
-                    "serialise"
-                    "semigroupoids"
-                    "unordered-containers"
-                    "yaml"
-                  ];
+                doCheckExtension =
+                  mass pkgsNew.haskell.lib.doCheck
+                    (   [ "dhall-bash"
+                          "dhall-json"
+                          # The test suite fails due to a relative reference
+                          # to ../dhall/dhall-lang/
+                          # "dhall-lsp-server"
+                          "dhall-nix"
+                          "dhall-text"
+                        ]
+                        # Test suite doesn't work on GHCJS or GHC 7.10.3
+                    ++  pkgsNew.lib.optional (!(compiler == "ghcjs" || compiler == "ghc7103")) "dhall"
+                    );
 
                 failOnAllWarningsExtension =
-                  mass pkgsNew.haskell.lib.failOnAllWarnings [
+                  mass failOnAllWarnings [
                     "dhall"
                     "dhall-bash"
                     "dhall-json"
@@ -103,6 +162,12 @@ let
 
                 extension =
                   haskellPackagesNew: haskellPackagesOld: {
+                    mkDerivation =
+                      args: haskellPackagesOld.mkDerivation (args // {
+                          doCheck = false;
+                        }
+                      );
+
                     dhall =
                       applyCoverage
                         (haskellPackagesNew.callCabal2nix
@@ -123,6 +188,18 @@ let
                         ../dhall-json
                         { };
 
+                    dhall-lsp-server =
+                      haskellPackagesNew.callCabal2nix
+                        "dhall-lsp-server"
+                        ../dhall-lsp-server
+                        { };
+
+                    dhall-nix =
+                      haskellPackagesNew.callCabal2nix
+                        "dhall-nix"
+                        ../dhall-nix
+                        { };
+
                     dhall-text =
                       haskellPackagesNew.callCabal2nix
                         "dhall-text"
@@ -130,13 +207,21 @@ let
                         { };
 
                     dhall-try =
-                      haskellPackagesNew.callCabal2nix
-                        "dhall-try"
-                        (builtins.filterSource
-                          (path: _: baseNameOf path != "index.html")
-                          ../dhall-try
+                      pkgsNew.haskell.lib.overrideCabal
+                        (haskellPackagesNew.callCabal2nix
+                          "dhall-try"
+                          (builtins.filterSource
+                            (path: _: baseNameOf path != "index.html")
+                            ../dhall-try
+                          )
+                          { }
                         )
-                        { };
+                        (old: {
+                            postInstall = (old.postInstall or "") + ''
+                              ${pkgsNew.closurecompiler}/bin/closure-compiler $out/bin/dhall-try.jsexe/all.js --jscomp_off=checkVars --externs=$out/bin/dhall-try.jsexe/all.js.externs > $out/bin/dhall-try.jsexe/all.min.js
+                            '';
+                          }
+                        );
                   };
 
               in
@@ -144,9 +229,9 @@ let
                   pkgsNew.lib.composeExtensions
                   (old.overrides or (_: _: {}))
                   [ (pkgsNew.haskell.lib.packagesFromDirectory { directory = ./.; })
-                    dontCheckExtension
-                    failOnAllWarningsExtension
                     extension
+                    doCheckExtension
+                    failOnAllWarningsExtension
                   ];
           }
         );
@@ -155,41 +240,27 @@ let
 
     npm = pkgsNew.callPackage ./npm { };
 
-    try-dhall-static = pkgsNew.runCommand "try-dhall-static" {} ''
-      ${pkgsNew.coreutils}/bin/mkdir $out
-      ${pkgsNew.coreutils}/bin/mkdir $out/{css,img,js}
-      ${pkgsNew.coreutils}/bin/cp ${../dhall-try/index.html} $out/index.html
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.twitterBootstrap}/js/bootstrap.min.js $out/js
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.twitterBootstrap}/js/bootstrap.min.js.map $out/js
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.twitterBootstrap}/css/bootstrap.min.css $out/css
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.npm.codemirror}/lib/node_modules/codemirror/lib/codemirror.js $out/js
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.npm.codemirror}/lib/node_modules/codemirror/mode/haskell/haskell.js $out/js
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.npm.codemirror}/lib/node_modules/codemirror/mode/javascript/javascript.js $out/js
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.npm.codemirror}/lib/node_modules/codemirror/lib/codemirror.css $out/css
-      ${pkgsNew.coreutils}/bin/ln --symbolic ${pkgsNew.dhall-logo} $out/img/dhall-logo.png
-      ${pkgsNew.closurecompiler}/bin/closure-compiler ${pkgsNew.haskell.packages.ghcjs.dhall-try}/bin/dhall-try.jsexe/all.js --jscomp_off=checkVars --externs=${pkgsNew.haskell.packages.ghcjs.dhall-try}/bin/dhall-try.jsexe/all.js.externs > $out/js/all.min.js
+    jQuery =
+      pkgsNew.fetchurl {
+        url    = "https://code.jquery.com/jquery-3.3.1.min.js";
+        sha256 = "1vq2bp290rhby5l09dv5khqwv3ysnzbddggbgk6m4hl9y9pl42hn";
+      };
 
-      ${pkgsNew.coreutils}/bin/mkdir $out/nix-support
-      ${pkgsNew.coreutils}/bin/echo "doc none $out/index.html" > $out/nix-support/hydra-build-products
-    '';
+    twitterBootstrap = pkgsNew.callPackage ./twitterBootstrap.nix { };
 
-    tarball-try-dhall = pkgsStaticLinux.releaseTools.binaryTarball rec {
-      src = pkgsNew.try-dhall-static;
+    website = pkgsNew.callPackage ./website.nix {};
+
+    tarball-website = pkgsStaticLinux.releaseTools.binaryTarball rec {
+      src = pkgsNew.website;
 
       installPhase = ''
-        releaseName=try-dhall
-        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/try-dhall/"    -D $src/index.html
-        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/try-dhall/img" -D $src/img/*
-        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/try-dhall/css" -D $src/css/*
-        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/try-dhall/js"  -D $src/js/*
+        releaseName=website
+        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/website/"    -D $src/index.html
+        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/website/img" -D $src/img/*
+        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/website/css" -D $src/css/*
+        ${pkgsNew.coreutils}/bin/install --target-directory "$TMPDIR/inst/website/js"  -D $src/js/*
       '';
     };
-
-
-
-    try-dhall-server = pkgsNew.writeScriptBin "try-dhall-server" ''
-      ${pkgsNew.haskellPackages.wai-app-static}/bin/warp --docroot ${pkgsNew.try-dhall-static}
-    '';
   };
 
   overlayCabal2nix = pkgsNew: pkgsOld: {
@@ -244,12 +315,22 @@ let
                           haskellPackagesNew.fail
                         ];
 
+                    blaze-builder =
+                      pkgsNew.haskell.lib.addBuildDepend
+                        haskellPackagesOld.blaze-builder
+                        haskellPackagesNew.semigroups;
+
                     cborg =
                       pkgsNew.haskell.lib.addBuildDepends
                         haskellPackagesOld.cborg
                         [ haskellPackagesNew.fail
                           haskellPackagesNew.semigroups
                         ];
+
+                    conduit =
+                      pkgsNew.haskell.lib.addBuildDepend
+                        haskellPackagesOld.conduit
+                        haskellPackagesNew.semigroups;
 
                     contravariant =
                       pkgsNew.haskell.lib.addBuildDepends
@@ -265,14 +346,35 @@ let
                           haskellPackagesNew.mockery
                         ];
 
+                    generic-deriving =
+                      pkgsNew.haskell.lib.dontCheck
+                        haskellPackagesOld.generic-deriving;
+
+                    haskell-src =
+                      pkgsNew.haskell.lib.addBuildDepends
+                        haskellPackagesOld.haskell-src
+                        [ haskellPackagesNew.fail
+                          haskellPackagesNew.semigroups
+                        ];
+
                     megaparsec =
                       pkgsNew.haskell.lib.addBuildDepend
                         haskellPackagesOld.megaparsec
                         haskellPackagesNew.fail;
 
-                    generic-deriving =
-                      pkgsNew.haskell.lib.dontCheck
-                        haskellPackagesOld.generic-deriving;
+                    neat-interpolation =
+                      pkgsNew.haskell.lib.doJailbreak
+                        haskellPackagesOld.neat-interpolation;
+
+                    optparse-applicative =
+                      pkgsNew.haskell.lib.addBuildDepend
+                        haskellPackagesOld.optparse-applicative
+                        haskellPackagesNew.fail;
+
+                    parser-combinators =
+                      pkgsNew.haskell.lib.addBuildDepend
+                        haskellPackagesOld.parser-combinators
+                        haskellPackagesNew.semigroups;
 
                     prettyprinter =
                       pkgsNew.haskell.lib.addBuildDepend
@@ -280,9 +382,16 @@ let
                         haskellPackagesNew.semigroups;
 
                     transformers-compat =
-                      pkgsNew.haskell.lib.addBuildDepend
+                      pkgsNew.haskell.lib.addBuildDepends
                         haskellPackagesOld.transformers-compat
-                        haskellPackagesNew.generic-deriving;
+                        [ haskellPackagesNew.fail
+                          haskellPackagesNew.generic-deriving
+                        ];
+
+                    vector =
+                      pkgsNew.haskell.lib.addBuildDepend
+                        haskellPackagesOld.vector
+                        haskellPackagesNew.semigroups;
 
                     # For some reason, `Cabal-1.22.5` does not respect the
                     # `buildable: False` directive for the executable section
@@ -293,6 +402,9 @@ let
                     wcwidth =
                       pkgsNew.haskell.lib.appendPatch
                         haskellPackagesOld.wcwidth ./wcwidth.patch;
+
+                    yaml =
+                      pkgsNew.haskell.lib.doJailbreak haskellPackagesOld.yaml;
                   };
 
               in
@@ -305,6 +417,38 @@ let
     };
   };
 
+  overlayGHC861 = pkgsNew: pkgsOld: {
+    haskell = pkgsOld.haskell // {
+      packages = pkgsOld.haskell.packages // {
+        "${compiler}" = pkgsOld.haskell.packages."${compiler}".override (old: {
+            overrides =
+              let
+                extension =
+                  haskellPackagesNew: haskellPackagesOld: {
+                    # GHC 8.6.1 accidentally shipped with an unpublished
+                    # unix-2.8 package.  Normally we'd deal with that by
+                    # using `pkgsNew.haskell.lib.jailbreak` but it doesn't
+                    # work for dependencies guarded by conditions.  See:
+                    # 
+                    # https://github.com/peti/jailbreak-cabal/issues/7
+                    turtle =
+                      pkgsNew.haskell.lib.appendPatch
+                        haskellPackagesOld.turtle
+                        ./turtle.patch;
+                  };
+
+              in
+                pkgsNew.lib.composeExtensions
+                  (old.overrides or (_: _: {}))
+                  extension;
+          }
+        );
+      };
+    };
+  };
+
+
+
   nixpkgs = fetchNixpkgs {
     rev = "1d4de0d552ae9aa66a5b8dee5fb0650a4372d148";
 
@@ -314,10 +458,16 @@ let
   };
 
   pkgs = import nixpkgs {
+    inherit system;
+
     config = {};
+
     overlays =
           [ overlayShared overlayCabal2nix ]
-      ++  (if compiler == "ghc7103" then [ overlayGHC7103 ] else []);
+      ++  (      if compiler == "ghc7103" then [ overlayGHC7103 ]
+            else if compiler == "ghc861"  then [ overlayGHC861  ]
+            else                               [                ]
+          );
   };
 
   overlayStaticLinux = pkgsNew: pkgsOld: {
@@ -387,6 +537,12 @@ let
                     dhall-json-static =
                         pkgsNew.haskell.lib.statify haskellPackagesOld.dhall-json;
 
+                    dhall-lsp-server-static =
+                        pkgsNew.haskell.lib.statify haskellPackagesOld.dhall-lsp-server;
+
+                    dhall-nix-static =
+                        pkgsNew.haskell.lib.statify haskellPackagesOld.dhall-nix;
+
                     dhall-text-static =
                         pkgsNew.haskell.lib.statify haskellPackagesOld.dhall-text;
                   };
@@ -417,9 +573,14 @@ let
     system = "x86_64-linux";
   };
 
-  # Derivation that trivially depends on the current directory so that Hydra's
-  # pull request builder always posts a GitHub status on each revision
-  pwd = pkgs.runCommand "pwd" { here = ../.; } "touch $out";
+  trivial = x: pkgs.runCommand "trivial" { inherit x; } "touch $out";
+
+  makeStaticIfPossible = name:
+    if pkgs.stdenv.isLinux
+    then
+      pkgsStaticLinux.pkgsMusl.haskell.packages."${compiler}"."${name}-static"
+    else
+      pkgs.haskell.lib.justStaticExecutables (pkgs.haskell.packages."${compiler}"."${name}");
 
   makeTarball = name:
     pkgsStaticLinux.releaseTools.binaryTarball rec {
@@ -432,34 +593,65 @@ let
     };
 
   toShell = drv:
-    if compiler == "ghcjs"
-    then
-        # `doctest` doesn't work with `ghcjs`
-        (pkgs.haskell.lib.dontCheck drv).env
-    else
-        # Benchmark dependencies aren't added by default
-        (pkgs.haskell.lib.doBenchmark drv).env;
+    # Benchmark dependencies aren't added by default
+    (pkgs.haskell.lib.doBenchmark drv).env;
+
+  possibly-static = {
+    dhall            = makeStaticIfPossible "dhall"           ;
+    dhall-bash       = makeStaticIfPossible "dhall-bash"      ;
+    dhall-json       = makeStaticIfPossible "dhall-json"      ;
+    dhall-lsp-server = makeStaticIfPossible "dhall-lsp-server";
+    dhall-nix        = makeStaticIfPossible "dhall-nix"       ;
+    dhall-text       = makeStaticIfPossible "dhall-text"      ;
+  };
+
+  toDockerImage = name:
+    let
+      image =
+        pkgs.dockerTools.buildImage {
+          inherit name;
+
+          contents = [ possibly-static."${name}" ];
+        };
+
+    in
+      pkgs.runCommand "image-${name}" {} ''
+        ${pkgs.coreutils}/bin/mkdir --parents "$out/nix-support"
+        ${pkgs.coreutils}/bin/ln --symbolic '${image}' "$out/docker-image-${name}.tar.gz"
+        echo "file binary-dist $out/docker-image-${name}.tar.gz" >> $out/nix-support/hydra-build-products
+      '';
 
 in
   rec {
-    inherit pwd;
+    inherit trivial pkgs possibly-static;
 
-    tarball-dhall      = makeTarball "dhall"     ;
-    tarball-dhall-bash = makeTarball "dhall-bash";
-    tarball-dhall-json = makeTarball "dhall-json";
-    tarball-dhall-text = makeTarball "dhall-text";
+    tarball-dhall            = makeTarball "dhall"           ;
+    tarball-dhall-bash       = makeTarball "dhall-bash"      ;
+    tarball-dhall-json       = makeTarball "dhall-json"      ;
+    tarball-dhall-lsp-server = makeTarball "dhall-lsp-server";
+    tarball-dhall-nix        = makeTarball "dhall-nix"       ;
+    tarball-dhall-text       = makeTarball "dhall-text"      ;
 
-    inherit (pkgs) tarball-try-dhall try-dhall-server try-dhall-static;
+    inherit (pkgs) tarball-website website;
 
-    inherit (pkgs.haskell.packages."${compiler}") dhall dhall-bash dhall-json dhall-text dhall-try;
+    inherit (pkgs.haskell.packages."${compiler}") dhall dhall-bash dhall-json dhall-lsp-server dhall-nix dhall-text dhall-try;
 
     inherit (pkgs.releaseTools) aggregate;
 
-    shell-dhall      = toShell pkgs.haskell.packages."${compiler}".dhall     ;
-    shell-dhall-bash = toShell pkgs.haskell.packages."${compiler}".dhall-bash;
-    shell-dhall-json = toShell pkgs.haskell.packages."${compiler}".dhall-json;
-    shell-dhall-text = toShell pkgs.haskell.packages."${compiler}".dhall-text;
-    shell-dhall-try  = toShell pkgs.haskell.packages."${compiler}".dhall-try ;
+    shell-dhall            = toShell pkgs.haskell.packages."${compiler}".dhall           ;
+    shell-dhall-bash       = toShell pkgs.haskell.packages."${compiler}".dhall-bash      ;
+    shell-dhall-json       = toShell pkgs.haskell.packages."${compiler}".dhall-json      ;
+    shell-dhall-lsp-server = toShell pkgs.haskell.packages."${compiler}".dhall-lsp-server;
+    shell-dhall-nix        = toShell pkgs.haskell.packages."${compiler}".dhall-nix       ;
+    shell-dhall-text       = toShell pkgs.haskell.packages."${compiler}".dhall-text      ;
+    shell-dhall-try        = toShell pkgs.haskell.packages."${compiler}".dhall-try       ;
+
+    image-dhall            = toDockerImage "dhall"           ;
+    image-dhall-bash       = toDockerImage "dhall-bash"      ;
+    image-dhall-json       = toDockerImage "dhall-json"      ;
+    image-dhall-lsp-server = toDockerImage "dhall-lsp-server";
+    image-dhall-nix        = toDockerImage "dhall-nix"       ;
+    image-dhall-text       = toDockerImage "dhall-text"      ;
 
     test-dhall =
       pkgs.mkShell

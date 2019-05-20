@@ -11,24 +11,33 @@ module Dhall.Repl
     ) where
 
 import Control.Exception ( SomeException(SomeException), displayException, throwIO )
+import Control.Monad ( forM_ )
+import Control.Monad.Fail ( MonadFail )
 import Control.Monad.IO.Class ( MonadIO, liftIO )
 import Control.Monad.State.Class ( MonadState, get, modify )
 import Control.Monad.State.Strict ( evalStateT )
-import Data.List ( elemIndex, isPrefixOf, nub )
+-- For the MonadFail instance for StateT.
+import Control.Monad.Trans.Instances ()
+import Data.List ( isPrefixOf, nub )
 import Data.List.NonEmpty (NonEmpty(..))
+import Data.Maybe ( mapMaybe )
 import Data.Semigroup ((<>))
+import Data.Text ( Text )
 import Dhall.Binary (StandardVersion(..))
 import Dhall.Context (Context)
-import Dhall.Import (standardVersion)
+import Dhall.Import (hashExpressionToCode, standardVersion)
 import Dhall.Pretty (CharacterSet(..))
 import Lens.Family (set)
 import System.Console.Haskeline (Interrupt(..))
 import System.Console.Haskeline.Completion ( Completion, simpleCompletion )
+import System.Directory ( getDirectoryContents )
 import System.Environment ( getEnvironment )
 
+import qualified Control.Monad.Fail as Fail
 import qualified Control.Monad.Trans.State.Strict as State
 import qualified Data.HashSet
 import qualified Data.Text as Text
+import qualified Data.Text.IO as Text.IO
 import qualified Data.Text.Prettyprint.Doc as Pretty
 import qualified Data.Text.Prettyprint.Doc.Render.Terminal as Pretty ( renderIO )
 import qualified Dhall
@@ -74,6 +83,7 @@ data Env = Env
   , explain          :: Bool
   , characterSet     :: CharacterSet
   , _standardVersion :: StandardVersion
+  , outputHandle     :: Maybe System.IO.Handle
   }
 
 
@@ -85,6 +95,7 @@ emptyEnv =
     , explain = False
     , _standardVersion = Dhall.Binary.defaultStandardVersion
     , characterSet = Unicode
+    , outputHandle = Just System.IO.stdout
     }
 
 
@@ -138,14 +149,12 @@ eval src = do
 
   modify ( \e -> e { envIt = Just ( Binding expr exprType ) } )
 
-  output System.IO.stdout expr
+  output expr
 
 
 
-typeOf :: ( MonadIO m, MonadState Env m ) => [String] -> m ()
-typeOf [] =
-  liftIO ( putStrLn ":type requires an argument to check the type of" )
-
+typeOf :: ( MonadFail m, MonadIO m, MonadState Env m ) => [String] -> m ()
+typeOf [] = Fail.fail ":type requires an argument to check the type of"
 
 typeOf srcs = do
   loaded <-
@@ -157,7 +166,7 @@ typeOf srcs = do
   exprType' <-
     normalize exprType
 
-  output System.IO.stdout exprType'
+  output exprType'
 
 
 applyContext
@@ -202,22 +211,17 @@ typeCheck expression = do
 -- Separate the equal sign to be its own word in order to simplify parsing
 -- This is intended to be used with the options that require assignment
 separateEqual :: [String] -> [String]
-separateEqual [] = []
-separateEqual (x:xs)
-  -- Handle the case where there is no space between the var and "="
-  | Just i <- elemIndex '=' x
-  = let (a, _:b) = splitAt i x
-    in  a : "=" : b : xs
+separateEqual [] =
+    []
+separateEqual (str₀ : ('=' : str₁) : strs) =
+    str₀ : "=" : str₁ : strs
+separateEqual (str : strs)
+    | (str₀, '=' : str₁) <- break (== '=') str =
+        str₀ : "=" : str₁ : strs
+    | otherwise =
+        str : strs
 
-  -- Handle the case where there is no space between the "=" and the expression
-  | ('=':y):ys <- xs
-  = x : "=" : y : ys
-
-  | otherwise
-  = x : xs
-
-
-addBinding :: ( MonadIO m, MonadState Env m ) => [String] -> m ()
+addBinding :: ( MonadFail m, MonadIO m, MonadState Env m ) => [String] -> m ()
 addBinding (k : "=" : srcs) = do
   let
     varName =
@@ -243,14 +247,125 @@ addBinding (k : "=" : srcs) = do
           }
     )
 
-  output
-    System.IO.stdout
-    ( Expr.Annot ( Expr.Var ( Dhall.V varName 0 ) ) t )
+  output ( Expr.Annot ( Expr.Var ( Dhall.V varName 0 ) ) t )
 
-addBinding _ =
-  liftIO ( fail ":let should be of the form `:let x = y`" )
+addBinding _ = Fail.fail ":let should be of the form `:let x = y`"
 
-saveBinding :: ( MonadIO m, MonadState Env m ) => [String] -> m ()
+hashBinding :: ( MonadFail m, MonadIO m, MonadState Env m ) => [String] -> m ()
+hashBinding [] = Fail.fail ":hash should be of the form `:hash expr"
+hashBinding tokens = do
+  loadedExpression <- parseAndLoad (unwords tokens)
+
+  _ <- typeCheck loadedExpression
+
+  normalizedExpression <- normalize loadedExpression
+
+  Env{_standardVersion} <- get
+
+  writeOutputHandle $ hashExpressionToCode _standardVersion normalizedExpression
+
+saveFilePrefix :: FilePath
+saveFilePrefix = ".dhall-repl"
+
+-- | Find the index for the current _active_ dhall save file
+currentSaveFileIndex :: MonadIO m => m (Maybe Int)
+currentSaveFileIndex = do
+  files <- liftIO $ getDirectoryContents "."
+
+  let parseIndex file
+        | saveFilePrefix `isPrefixOf` file
+        , '-':index <- drop (length saveFilePrefix) file
+        , [(x, "")] <- reads index -- safe version of read
+        = Just x
+
+        | otherwise
+        = Nothing
+
+  pure $ case mapMaybe parseIndex files of
+    [] -> Nothing
+    xs -> Just $ maximum xs
+
+-- | Find the name for the current _active_ dhall save file
+currentSaveFile :: MonadIO m => m (Maybe FilePath)
+currentSaveFile =
+  (fmap . fmap) (\i -> saveFilePrefix <> "-" <> show i) currentSaveFileIndex
+
+-- | Find the name for the next dhall save file
+nextSaveFile :: MonadIO m => m FilePath
+nextSaveFile = do
+  mIndex <- currentSaveFileIndex
+
+  let nextIndex = maybe 0 succ mIndex
+
+  pure $ saveFilePrefix <> "-" <> show nextIndex
+
+loadBinding
+  :: ( MonadFail m, MonadIO m, MonadState Env m, Haskeline.MonadException m )
+  => [String] -> m ()
+loadBinding [] = do
+  mFile <- currentSaveFile
+
+  case mFile of
+    Just file -> loadBinding [file]
+    Nothing   ->
+      Fail.fail $ ":load couldn't find any `" <> saveFilePrefix <> "-*` files"
+
+loadBinding [file] = do
+  -- Read commands from the save file
+  replLines <- map words . lines <$> liftIO (readFile file)
+
+  let runCommand ((c:cmd):opts)
+        | c == optionsPrefix
+        , Just action <- lookup cmd options
+        = action opts
+      runCommand _ = Fail.fail $
+        ":load expects `" <> file <> "` to contain one command per line"
+
+  -- Keep current handle in scope
+  Env { outputHandle } <- get
+
+  -- Discard output
+  modify (\e -> e { outputHandle = Nothing })
+
+  -- Run all the commands
+  forM_ replLines runCommand
+
+  -- Restore the previous handle
+  modify (\e -> e { outputHandle = outputHandle })
+
+  writeOutputHandle $ "Loaded `" <> Text.pack file <> "`\n"
+
+loadBinding _ = Fail.fail ":load should be of the form `:load` or `:load file`"
+
+saveBinding :: ( MonadFail m, MonadIO m, MonadState Env m ) => [String] -> m ()
+-- Save all the bindings into a context save file
+saveBinding [] = do
+  file <- nextSaveFile
+
+  saveBinding [file]
+
+-- Save all the bindings into `file`
+saveBinding [file] = do
+  env <- get
+
+  let bindings
+        = reverse
+        . (fmap . fmap) bindingExpr
+        . Dhall.Context.toList
+        $ envBindings env
+
+      handler handle =
+          State.evalStateT
+            (forM_ bindings $ \(name, expr) -> do
+              liftIO (System.IO.hPutStr handle $ ":let " <> Text.unpack name <> " = ")
+              outputWithoutSpacing expr)
+            (env { outputHandle = Just handle })
+
+  liftIO (System.IO.withFile file System.IO.WriteMode handler)
+
+  writeOutputHandle $ "Context saved to `" <> Text.pack file <> "`\n"
+
+-- Save a single expression to `file`
 saveBinding (file : "=" : tokens) = do
   loadedExpression <- parseAndLoad (unwords tokens)
 
@@ -261,10 +376,27 @@ saveBinding (file : "=" : tokens) = do
   env <- get
 
   let handler handle =
-          State.evalStateT (output handle normalizedExpression) env
+          State.evalStateT
+            (output normalizedExpression)
+            (env { outputHandle = Just handle })
 
   liftIO (System.IO.withFile file System.IO.WriteMode handler)
-saveBinding _ = fail ":save should be of the form `:save x = y`"
+
+  writeOutputHandle $ "Expression saved to `" <> Text.pack file <> "`\n"
+
+saveBinding _ = Fail.fail ":save should be of the form `:save`, `:save file`, or `:save file = expr`"
+
+setOption :: ( MonadIO m, MonadState Env m ) => [String] -> m ()
+setOption [ "--explain" ] = do
+  modify (\e -> e { explain = True })
+setOption _ = do
+  writeOutputHandle ":set should be of the form `:set <command line option>`"
+
+unsetOption :: ( MonadIO m, MonadState Env m ) => [String] -> m ()
+unsetOption [ "--explain" ] = do
+  modify (\e -> e { explain = False })
+unsetOption _ = do
+  writeOutputHandle ":unset should be of the form `:unset <command line option>`"
 
 cmdQuit :: ( MonadIO m, MonadState Env m ) => [String] -> m ()
 cmdQuit _ = do
@@ -277,18 +409,22 @@ optionsPrefix = ':'
 
 
 options
-  :: ( Haskeline.MonadException m, MonadIO m, MonadState Env m )
+  :: ( Haskeline.MonadException m, MonadFail m, MonadIO m, MonadState Env m )
   => Repline.Options m
 options =
   [ ( "type", dontCrash . typeOf )
+  , ( "hash", dontCrash . hashBinding )
   , ( "let", dontCrash . addBinding . separateEqual )
+  , ( "load", dontCrash . loadBinding )
   , ( "save", dontCrash . saveBinding . separateEqual )
+  , ( "set", dontCrash . setOption)
+  , ( "unset", dontCrash . unsetOption)
   , ( "quit", cmdQuit )
   ]
 
 
 completer
-  :: (Monad m, MonadIO m, MonadState Env m)
+  :: (Monad m, MonadFail m, MonadIO m, MonadState Env m)
   => Repline.CompleterStyle m
 completer =
   Repline.Prefix
@@ -301,13 +437,17 @@ completer =
     separators = " \t[(,=+*&|}#?>:"
 
 completeFunc
-  :: (Monad m, MonadIO m, MonadState Env m)
+  :: (Monad m, MonadFail m, MonadIO m, MonadState Env m)
   => String -> String -> m [Completion]
 completeFunc reversedPrev word
 
   -- Complete commands
   | reversedPrev == ":"
   = pure . listCompletion $ fst <$> (options :: Repline.Options Repl)
+
+  -- Complete load command
+  | reversedPrev == reverse ":load "
+  = Haskeline.listFiles word
 
   -- Complete file paths
   | any (`isPrefixOf` word) [ "/", "./", "../", "~/" ]
@@ -318,11 +458,10 @@ completeFunc reversedPrev word
   = listCompletion . fmap fst <$> liftIO getEnvironment
 
   -- Complete record fields and union alternatives
-  | '.' `elem` word
+  | var : subFields <- Text.split (== '.') (Text.pack word)
+  , not $ null subFields
   = do
     Env { envBindings } <- get
-
-    let var:subFields = Text.split (== '.') (Text.pack word)
 
     case Dhall.Context.lookup var 0 envBindings of
 
@@ -345,25 +484,28 @@ completeFunc reversedPrev word
   where
     listCompletion = map simpleCompletion . filter (word `isPrefixOf`)
 
-    algebraicComplete :: [Text.Text] -> Dhall.Expr Dhall.Src Dhall.X -> [Text.Text]
+    algebraicComplete
+        :: [Text.Text] -> Dhall.Expr Dhall.Src Dhall.X -> [Text.Text]
     algebraicComplete subFields expr =
       let keys = fmap ("." <>) . Map.keys
 
-          withMap m
-            | [] <- subFields   = keys m
-            -- Stop on last subField (we care about the keys at this level)
-            | [_] <- subFields  = keys m
-            | f:fs <- subFields =
-              maybe
-                []
-                (fmap (("." <> f) <>) . algebraicComplete fs)
-                (Map.lookup f m)
+          withMap m =
+              case subFields of
+                  [] -> keys m
+                  -- Stop on last subField (we care about the keys at this level)
+                  [_] -> keys m
+                  f:fs ->
+                      case Map.lookup f m of
+                          Nothing ->
+                              []
+                          Just Nothing ->
+                              keys m
+                          Just (Just e) ->
+                              fmap (("." <> f) <>) (algebraicComplete fs e)
 
       in  case expr of
-            Dhall.Core.Record       m -> withMap m
-            Dhall.Core.RecordLit    m -> withMap m
+            Dhall.Core.RecordLit    m -> withMap (fmap Just m)
             Dhall.Core.Union        m -> withMap m
-            Dhall.Core.UnionLit _ _ m -> withMap m
             _                         -> []
 
 
@@ -378,26 +520,42 @@ dontCrash m =
     m
     ( \ e@SomeException{} -> liftIO ( putStrLn ( displayException e ) ) )
 
+writeOutputHandle :: (MonadIO m, MonadState Env m) => Text -> m ()
+writeOutputHandle txt = do
+  Env { outputHandle } <- get
+
+  case outputHandle of
+    Just handle -> liftIO $ Text.IO.hPutStrLn handle txt
+    Nothing     -> pure ()
 
 output
-    :: (Pretty.Pretty a, MonadState Env m, MonadIO m)
-    => System.IO.Handle -> Dhall.Expr s a -> m ()
-output handle expr = do
-  Env { characterSet } <- get
+  :: (Pretty.Pretty a, MonadState Env m, MonadIO m)
+  => Dhall.Expr s a -> m ()
+output expr = do
+  writeOutputHandle "" -- Visual spacing
 
-  liftIO (System.IO.hPutStrLn handle "")  -- Visual spacing
+  outputWithoutSpacing expr
 
-  let stream =
-          Pretty.layoutSmart Dhall.Pretty.layoutOpts
-              (Dhall.Pretty.prettyCharacterSet characterSet expr)
+  writeOutputHandle "" -- Visual spacing
 
-  supportsANSI <- liftIO (System.Console.ANSI.hSupportsANSI handle)
-  let ansiStream =
-          if supportsANSI
-          then fmap Dhall.Pretty.annToAnsiStyle stream
-          else Pretty.unAnnotateS stream
+outputWithoutSpacing
+  :: (Pretty.Pretty a, MonadState Env m, MonadIO m)
+  => Dhall.Expr s a -> m ()
+outputWithoutSpacing expr = do
+  Env { characterSet, outputHandle } <- get
 
-  liftIO (Pretty.renderIO handle ansiStream)
-  liftIO (System.IO.hPutStrLn handle "") -- Pretty printing doesn't end with a new line
+  case outputHandle of
+    Nothing     -> pure ()
+    Just handle -> do
+      let stream =
+              Pretty.layoutSmart Dhall.Pretty.layoutOpts
+                  (Dhall.Pretty.prettyCharacterSet characterSet expr)
 
-  liftIO (System.IO.hPutStrLn handle "")  -- Visual spacing
+      supportsANSI <- liftIO (System.Console.ANSI.hSupportsANSI handle)
+      let ansiStream =
+              if supportsANSI
+              then fmap Dhall.Pretty.annToAnsiStyle stream
+              else Pretty.unAnnotateS stream
+
+      liftIO (Pretty.renderIO handle ansiStream)
+      liftIO (System.IO.hPutStrLn handle "") -- Pretty printing doesn't end with a new line

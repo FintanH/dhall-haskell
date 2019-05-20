@@ -20,7 +20,7 @@ module Dhall.Main
     ) where
 
 import Control.Applicative (optional, (<|>))
-import Control.Exception (Exception, SomeException)
+import Control.Exception (SomeException)
 import Data.Monoid ((<>))
 import Data.Text (Text)
 import Data.Text.Prettyprint.Doc (Doc, Pretty)
@@ -70,6 +70,7 @@ import qualified Paths_dhall as Meta
 import qualified System.Console.ANSI
 import qualified System.IO
 import qualified Text.Dot
+import qualified Data.Map
 
 -- | Top-level program options
 data Options = Options
@@ -82,19 +83,25 @@ data Options = Options
 
 -- | The subcommands for the @dhall@ executable
 data Mode
-    = Default { annotate :: Bool }
+    = Default { file :: Maybe FilePath, annotate :: Bool, alpha :: Bool }
     | Version
-    | Resolve { dot :: Bool }
-    | Type
-    | Normalize
+    | Resolve { file :: Maybe FilePath, resolveMode :: Maybe ResolveMode }
+    | Type { file :: Maybe FilePath }
+    | Normalize { file :: Maybe FilePath, alpha :: Bool }
     | Repl
-    | Format { inplace :: Maybe FilePath }
-    | Freeze { inplace :: Maybe FilePath }
+    | Format { formatMode :: Dhall.Format.FormatMode }
+    | Freeze { inplace :: Maybe FilePath, all_ :: Bool }
     | Hash
     | Diff { expr1 :: Text, expr2 :: Text }
     | Lint { inplace :: Maybe FilePath }
-    | Encode { json :: Bool }
-    | Decode { json :: Bool }
+    | Encode { file :: Maybe FilePath, json :: Bool }
+    | Decode { file :: Maybe FilePath, json :: Bool }
+
+data ResolveMode
+    = Dot
+    | ListTransitiveDependencies
+    | ListImmediateDependencies
+
 
 -- | `Parser` for the `Options` type
 parseOptions :: Parser Options
@@ -134,15 +141,15 @@ parseMode =
     <|> subcommand
             "resolve"
             "Resolve an expression's imports"
-            (Resolve <$> parseDot)
+            (Resolve <$> optional parseFile <*> parseResolveMode)
     <|> subcommand
             "type"
             "Infer an expression's type"
-            (pure Type)
+            (Type <$> optional parseFile)
     <|> subcommand
             "normalize"
             "Normalize an expression"
-            (pure Normalize)
+            (Normalize <$> optional parseFile <*> parseAlpha)
     <|> subcommand
             "repl"
             "Interpret expressions in a REPL"
@@ -162,36 +169,64 @@ parseMode =
     <|> subcommand
             "format"
             "Formatter for the Dhall language"
-            (Format <$> optional parseInplace)
+            (Format <$> parseFormatMode)
     <|> subcommand
             "freeze"
-            "Add hashes to all import statements of an expression"
-            (Freeze <$> optional parseInplace)
+            "Add integrity checks to remote import statements of an expression"
+            (Freeze <$> optional parseInplace <*> parseAllFlag)
     <|> subcommand
             "encode"
             "Encode a Dhall expression to binary"
-            (Encode <$> parseJSONFlag)
+            (Encode <$> optional parseFile <*> parseJSONFlag)
     <|> subcommand
             "decode"
             "Decode a Dhall expression from binary"
-            (Decode <$> parseJSONFlag)
-    <|> (Default <$> parseAnnotate)
+            (Decode <$> optional parseFile <*> parseJSONFlag)
+    <|> (Default <$> optional parseFile <*> parseAnnotate <*> parseAlpha)
   where
     argument =
             fmap Data.Text.pack
         .   Options.Applicative.strArgument
         .   Options.Applicative.metavar
 
+    parseFile =
+        Options.Applicative.strOption
+            (   Options.Applicative.long "file"
+            <>  Options.Applicative.help "Read expression from a file instead of standard input"
+            <>  Options.Applicative.metavar "FILE"
+            )
+
+    parseAlpha =
+        Options.Applicative.switch
+            (   Options.Applicative.long "alpha"
+            <>  Options.Applicative.help "α-normalize expression"
+            )
+
     parseAnnotate =
         Options.Applicative.switch
-            (Options.Applicative.long "annotate")
+            (   Options.Applicative.long "annotate"
+            <>  Options.Applicative.help "Add a type annotation to the output"
+            )
 
-    parseDot =
-        Options.Applicative.switch
-        (   Options.Applicative.long "dot"
-        <>  Options.Applicative.help
-              "Output import dependency graph in dot format"
-        )
+    parseResolveMode =
+          Options.Applicative.flag' (Just Dot)
+              (   Options.Applicative.long "dot"
+              <>  Options.Applicative.help
+                    "Output import dependency graph in dot format"
+              )
+        <|>
+          Options.Applicative.flag' (Just ListImmediateDependencies)
+              (   Options.Applicative.long "immediate-dependencies"
+              <>  Options.Applicative.help
+                    "List immediate import dependencies"
+              )
+        <|>
+          Options.Applicative.flag' (Just ListTransitiveDependencies)
+              (   Options.Applicative.long "transitive-dependencies"
+              <>  Options.Applicative.help
+                    "List transitive import dependencies"
+              )
+        <|> pure Nothing
 
     parseInplace =
         Options.Applicative.strOption
@@ -206,15 +241,32 @@ parseMode =
         <>  Options.Applicative.help "Use JSON representation of CBOR"
         )
 
-throws :: Exception e => Either e a -> IO a
-throws (Left  e) = Control.Exception.throwIO e
-throws (Right a) = return a
+    parseAllFlag =
+        Options.Applicative.switch
+        (   Options.Applicative.long "all"
+        <>  Options.Applicative.help "Add integrity checks to all imports (not just remote imports)"
+        )
 
-getExpression :: IO (Expr Src Import)
-getExpression = do
-    inText <- Data.Text.IO.getContents
+    parseCheck =
+        Options.Applicative.switch
+        (   Options.Applicative.long "check"
+        <>  Options.Applicative.help "Only check if the input is formatted"
+        )
 
-    throws (Dhall.Parser.exprFromText "(stdin)" inText)
+    parseFormatMode = adapt <$> parseCheck <*> optional parseInplace
+      where
+        adapt True  path    = Dhall.Format.Check {..}
+        adapt False inplace = Dhall.Format.Modify {..}
+
+getExpression :: Maybe FilePath -> IO (Expr Src Import)
+getExpression maybeFile = do
+    inText <- do
+        case maybeFile of
+            Just "-"  -> Data.Text.IO.getContents
+            Just file -> Data.Text.IO.readFile file
+            Nothing   -> Data.Text.IO.getContents
+
+    Dhall.Core.throws (Dhall.Parser.exprFromText "(stdin)" inText)
 
 -- | `ParserInfo` for the `Options` type
 parserInfoOptions :: ParserInfo Options
@@ -234,9 +286,14 @@ command (Options {..}) = do
 
     GHC.IO.Encoding.setLocaleEncoding System.IO.utf8
 
-    let status =
-            set Dhall.Import.standardVersion standardVersion (Dhall.Import.emptyStatus ".")
-
+    let toStatus maybeFile =
+            set Dhall.Import.standardVersion standardVersion
+                (Dhall.Import.emptyStatus file)
+          where
+            file = case maybeFile of
+                Just "-" -> "."
+                Just f   -> f
+                Nothing  -> "."
 
     let handle =
                 Control.Exception.handle handler2
@@ -262,8 +319,12 @@ command (Options {..}) = do
                         Control.Exception.throwIO (Imported ps e)
 
             handler2 e = do
-                let _ = e :: SomeException
-                System.IO.hPrint System.IO.stderr e
+                let string = show (e :: SomeException)
+
+                if not (null string)
+                    then System.IO.hPutStrLn System.IO.stderr string
+                    else return ()
+
                 System.Exit.exitFailure
 
     let renderDoc :: Handle -> Doc Ann -> IO ()
@@ -287,50 +348,95 @@ command (Options {..}) = do
 
     handle $ case mode of
         Version -> do
-            putStrLn (showVersion Meta.version)
+            let line₀ = "Haskell package version: "
+                    <>  Data.Text.pack (showVersion Meta.version)
+
+            let line₁ = "Standard version: "
+                    <>  Dhall.Binary.renderStandardVersion Dhall.Binary.defaultStandardVersion
+
+            Data.Text.IO.putStrLn line₀
+            Data.Text.IO.putStrLn line₁
 
         Default {..} -> do
-            expression <- getExpression
+            expression <- getExpression file
 
-            resolvedExpression <- State.evalStateT (Dhall.Import.loadWith expression) status
+            resolvedExpression <- State.evalStateT (Dhall.Import.loadWith expression) (toStatus file)
 
-            inferredType <- throws (Dhall.TypeCheck.typeOf resolvedExpression)
+            inferredType <- Dhall.Core.throws (Dhall.TypeCheck.typeOf resolvedExpression)
 
             let normalizedExpression = Dhall.Core.normalize resolvedExpression
 
+            let alphaNormalizedExpression =
+                    if alpha
+                    then Dhall.Core.alphaNormalize normalizedExpression
+                    else normalizedExpression
+
             let annotatedExpression =
                     if annotate
-                        then Annot normalizedExpression inferredType
-                        else normalizedExpression
+                        then Annot alphaNormalizedExpression inferredType
+                        else alphaNormalizedExpression
 
             render System.IO.stdout annotatedExpression
 
-        Resolve dot -> do
-            expression <- getExpression
+        Resolve { resolveMode = Just Dot, ..} -> do
+            expression <- getExpression file
 
-            (resolvedExpression, Dhall.Import.Types.Status { _dot }) <-
-                State.runStateT (Dhall.Import.loadWith expression) status
+            (Dhall.Import.Types.Status { _dot}) <-
+                State.execStateT (Dhall.Import.loadWith expression) (toStatus file)
 
-            if   dot
-            then putStr . ("strict " <>) . Text.Dot.showDot $
-                 Text.Dot.attribute ("rankdir", "LR") >> _dot
-            else render System.IO.stdout resolvedExpression
+            putStr . ("strict " <>) . Text.Dot.showDot $
+                   Text.Dot.attribute ("rankdir", "LR") >>
+                   _dot
 
-        Normalize -> do
-            expression <- getExpression
+        Resolve { resolveMode = Just ListImmediateDependencies, ..} -> do
+            expression <- getExpression file
+
+            mapM_ (print
+                        . Pretty.pretty
+                        . Dhall.Core.importHashed) expression
+
+        Resolve { resolveMode = Just ListTransitiveDependencies, ..} -> do
+            expression <- getExpression file
+
+            (Dhall.Import.Types.Status { _cache }) <-
+                State.execStateT (Dhall.Import.loadWith expression) (toStatus file)
+
+            mapM_ print
+                 .   fmap (   Pretty.pretty
+                          .   Dhall.Core.importType
+                          .   Dhall.Core.importHashed )
+                 .   Data.Map.keys
+                 $   _cache
+
+        Resolve { resolveMode = Nothing, ..} -> do
+            expression <- getExpression file
+
+            (resolvedExpression, _) <-
+                State.runStateT (Dhall.Import.loadWith expression) (toStatus file)
+            render System.IO.stdout resolvedExpression
+
+        Normalize {..} -> do
+            expression <- getExpression file
 
             resolvedExpression <- Dhall.Import.assertNoImports expression
 
-            _ <- throws (Dhall.TypeCheck.typeOf resolvedExpression)
+            _ <- Dhall.Core.throws (Dhall.TypeCheck.typeOf resolvedExpression)
 
-            render System.IO.stdout (Dhall.Core.normalize resolvedExpression)
+            let normalizedExpression = Dhall.Core.normalize resolvedExpression
 
-        Type -> do
-            expression <- getExpression
+            let alphaNormalizedExpression =
+                    if alpha
+                    then Dhall.Core.alphaNormalize normalizedExpression
+                    else normalizedExpression
+
+            render System.IO.stdout alphaNormalizedExpression
+
+        Type {..} -> do
+            expression <- getExpression file
 
             resolvedExpression <- Dhall.Import.assertNoImports expression
 
-            inferredType <- throws (Dhall.TypeCheck.typeOf resolvedExpression)
+            inferredType <- Dhall.Core.throws (Dhall.TypeCheck.typeOf resolvedExpression)
 
             render System.IO.stdout (Dhall.Core.normalize inferredType)
 
@@ -347,10 +453,10 @@ command (Options {..}) = do
             renderDoc System.IO.stdout diff
 
         Format {..} -> do
-            Dhall.Format.format characterSet inplace
+            Dhall.Format.format (Dhall.Format.Format {..})
 
         Freeze {..} -> do
-            Dhall.Freeze.freeze inplace standardVersion
+            Dhall.Freeze.freeze inplace all_ characterSet standardVersion
 
         Hash -> do
             Dhall.Hash.hash standardVersion
@@ -360,7 +466,7 @@ command (Options {..}) = do
                 Just file -> do
                     text <- Data.Text.IO.readFile file
 
-                    (header, expression) <- throws (Dhall.Parser.exprAndHeaderFromText file text)
+                    (header, expression) <- Dhall.Core.throws (Dhall.Parser.exprAndHeaderFromText file text)
 
                     let lintedExpression = Dhall.Lint.lint expression
 
@@ -373,7 +479,7 @@ command (Options {..}) = do
                 Nothing -> do
                     text <- Data.Text.IO.getContents
 
-                    (header, expression) <- throws (Dhall.Parser.exprAndHeaderFromText "(stdin)" text)
+                    (header, expression) <- Dhall.Core.throws (Dhall.Parser.exprAndHeaderFromText "(stdin)" text)
 
                     let lintedExpression = Dhall.Lint.lint expression
 
@@ -383,9 +489,9 @@ command (Options {..}) = do
                     renderDoc System.IO.stdout doc
 
         Encode {..} -> do
-            expression <- getExpression
+            expression <- getExpression file
 
-            let term = Dhall.Binary.encodeWithVersion standardVersion expression
+            let term = Dhall.Binary.encode expression
 
             let bytes = Codec.Serialise.serialise term
 
@@ -393,7 +499,7 @@ command (Options {..}) = do
                 then do
                     let decoder = Codec.CBOR.JSON.decodeValue False
 
-                    (_, value) <- throws (Codec.CBOR.Read.deserialiseFromBytes decoder bytes)
+                    (_, value) <- Dhall.Core.throws (Codec.CBOR.Read.deserialiseFromBytes decoder bytes)
 
                     let jsonBytes = Data.Aeson.Encode.Pretty.encodePretty value
 
@@ -403,7 +509,10 @@ command (Options {..}) = do
                     Data.ByteString.Lazy.putStr bytes
 
         Decode {..} -> do
-            bytes <- Data.ByteString.Lazy.getContents
+            bytes <- do
+                case file of
+                    Just f  -> Data.ByteString.Lazy.readFile f
+                    Nothing -> Data.ByteString.Lazy.getContents
 
             term <- do
                 if json
@@ -415,11 +524,11 @@ command (Options {..}) = do
                         let encoding = Codec.CBOR.JSON.encodeValue value
 
                         let cborBytes = Codec.CBOR.Write.toLazyByteString encoding
-                        throws (Codec.Serialise.deserialiseOrFail cborBytes)
+                        Dhall.Core.throws (Codec.Serialise.deserialiseOrFail cborBytes)
                     else do
-                        throws (Codec.Serialise.deserialiseOrFail bytes)
+                        Dhall.Core.throws (Codec.Serialise.deserialiseOrFail bytes)
 
-            expression <- throws (Dhall.Binary.decodeWithVersion term)
+            expression <- Dhall.Core.throws (Dhall.Binary.decodeExpression term)
 
             let doc = Dhall.Pretty.prettyCharacterSet characterSet expression
 

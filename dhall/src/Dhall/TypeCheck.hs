@@ -21,10 +21,12 @@ module Dhall.TypeCheck (
     , TypeMessage(..)
     ) where
 
+import Control.Applicative (empty)
 import Control.Exception (Exception)
 import Data.Data (Data(..))
 import Data.Foldable (forM_, toList)
 import Data.List.NonEmpty (NonEmpty(..))
+import Data.Monoid (First(..))
 import Data.Sequence (Seq, ViewL(..))
 import Data.Semigroup (Semigroup(..))
 import Data.Set (Set)
@@ -32,6 +34,7 @@ import Data.Text (Text)
 import Data.Text.Prettyprint.Doc (Doc, Pretty(..))
 import Data.Traversable (forM)
 import Data.Typeable (Typeable)
+import Dhall.Binary (FromTerm(..), ToTerm(..))
 import Dhall.Core (Binding(..), Const(..), Chunks(..), Expr(..), Var(..))
 import Dhall.Context (Context)
 import Dhall.Pretty (Ann, layoutOpts)
@@ -359,6 +362,8 @@ typeWithA tpa = loop
             Text -> return ()
             _    -> Left (TypeError ctx e (CantTextAppend r tr))
         return Text
+    loop _      TextShow          = do
+        return (Pi "_" Text Text)
     loop _      List              = do
         return (Pi "_" (Const Type) (Const Type))
     loop ctx e@(ListLit  Nothing  xs) = do
@@ -482,36 +487,17 @@ typeWithA tpa = loop
             Just (k0, t0, rest) -> do
                 s0 <- fmap Dhall.Core.normalize (loop ctx t0)
                 c <- case s0 of
-                    Const Type ->
-                        return Type
-                    Const Kind ->
-                        return Kind
-                    Const Sort
-                        | Dhall.Core.judgmentallyEqual t0 (Const Kind) ->
-                            return Sort
+                    Const c -> pure c
                     _ -> Left (TypeError ctx e (InvalidFieldType k0 t0))
                 let process k t = do
                         s <- fmap Dhall.Core.normalize (loop ctx t)
                         case s of
-                            Const Type ->
-                                if c == Type
+                            Const c' ->
+                                if c == c'
                                 then return ()
-                                else Left (TypeError ctx e (FieldAnnotationMismatch k t c k0 t0 Type))
-                            Const Kind ->
-                                if c == Kind
-                                then return ()
-                                else Left (TypeError ctx e (FieldAnnotationMismatch k t c k0 t0 Kind))
-                            Const Sort ->
-                                if c == Sort
-                                then
-                                    if Dhall.Core.judgmentallyEqual t (Const Kind)
-                                    then return ()
-                                    else Left (TypeError ctx e (InvalidFieldType k t))
-                                else Left (TypeError ctx e (FieldAnnotationMismatch k t c k0 t0 Sort))
-                            _ ->
-                                Left (TypeError ctx e (InvalidFieldType k t))
-                Dhall.Map.traverseWithKey_ process rest
-
+                                else Left (TypeError ctx e (FieldAnnotationMismatch k t c k0 t0 c'))
+                            _ -> Left (TypeError ctx e (InvalidFieldType k t))
+                Dhall.Map.unorderedTraverseWithKey_ process rest
                 return (Const c)
     loop ctx e@(RecordLit kvs   ) = do
         case Dhall.Map.toList kvs of
@@ -520,54 +506,64 @@ typeWithA tpa = loop
                 t0 <- loop ctx v0
                 s0 <- fmap Dhall.Core.normalize (loop ctx t0)
                 c <- case s0 of
-                    Const Type ->
-                        return Type
-                    Const Kind ->
-                        return Kind
-                    Const Sort
-                        | Dhall.Core.judgmentallyEqual t0 (Const Kind) ->
-                            return Sort
+                    Const c -> pure c
                     _       -> Left (TypeError ctx e (InvalidField k0 v0))
                 let process k v = do
                         t <- loop ctx v
                         s <- fmap Dhall.Core.normalize (loop ctx t)
                         case s of
-                            Const Type ->
-                                if c == Type
+                            Const c' ->
+                                if c == c'
                                 then return ()
-                                else Left (TypeError ctx e (FieldMismatch k v c k0 v0 Type))
-                            Const Kind ->
-                                if c == Kind
-                                then return ()
-                                else Left (TypeError ctx e (FieldMismatch k v c k0 v0 Kind))
-                            Const Sort ->
-                                if c == Sort
-                                then
-                                    if Dhall.Core.judgmentallyEqual t (Const Kind)
-                                    then return ()
-                                    else Left (TypeError ctx e (InvalidField k t))
-                                else Left (TypeError ctx e (FieldMismatch k v c k0 v0 Sort))
-                            _ ->
-                                Left (TypeError ctx e (InvalidField k t))
+                                else Left (TypeError ctx e (FieldMismatch k v c k0 v0 c'))
+                            _ -> Left (TypeError ctx e (InvalidField k t))
 
                         return t
                 kts <- Dhall.Map.traverseWithKey process kvs
                 return (Record kts)
     loop ctx e@(Union     kts   ) = do
-        let process k t = do
-                s <- fmap Dhall.Core.normalize (loop ctx t)
-                case s of
-                    Const Type -> return ()
-                    Const Kind -> return ()
-                    _          -> Left (TypeError ctx e (InvalidAlternativeType k t))
-        Dhall.Map.traverseWithKey_ process kts
-        return (Const Type)
+        let nonEmpty k mt = First (fmap (\t -> (k, t)) mt)
+
+        case getFirst (Dhall.Map.foldMapWithKey nonEmpty kts) of
+            Nothing -> do
+                return (Const Type)
+
+            Just (k0, t0) -> do
+                s0 <- fmap Dhall.Core.normalize (loop ctx t0)
+
+                c0 <- case s0 of
+                    Const c0 -> do
+                        return c0
+
+                    _ -> do
+                        Left (TypeError ctx e (InvalidAlternativeType k0 t0))
+
+                let process _ Nothing = do
+                        return ()
+
+                    process k (Just t) = do
+                        s <- fmap Dhall.Core.normalize (loop ctx t)
+
+                        c <- case s of
+                            Const c -> do
+                                return c
+
+                            _ -> do
+                                Left (TypeError ctx e (InvalidAlternativeType k t))
+
+                        if c0 == c
+                            then return ()
+                            else Left (TypeError ctx e (AlternativeAnnotationMismatch k t c k0 t0 c0))
+
+                Dhall.Map.unorderedTraverseWithKey_ process kts
+
+                return (Const c0)
     loop ctx e@(UnionLit k v kts) = do
         case Dhall.Map.lookup k kts of
             Just _  -> Left (TypeError ctx e (DuplicateAlternative k))
             Nothing -> return ()
         t <- loop ctx v
-        let union = Union (Dhall.Map.insert k (Dhall.Core.normalize t) kts)
+        let union = Union (Dhall.Map.insert k (Just (Dhall.Core.normalize t)) kts)
         _ <- loop ctx union
         return union
     loop ctx e@(Combine kvsX kvsY) = do
@@ -630,6 +626,8 @@ typeWithA tpa = loop
                 return Type
             decide Kind Kind =
                 return Kind
+            decide Sort Sort =
+                return Sort
             decide x y =
                 Left (TypeError ctx e (RecordTypeMismatch x y l r))
         c <- decide cL cR
@@ -687,19 +685,20 @@ typeWithA tpa = loop
             else Left (TypeError ctx e (RecordMismatch '⫽' kvsX kvsY constX constY))
 
         return (Record (Dhall.Map.union ktsY ktsX))
-    loop ctx e@(Merge kvsX kvsY (Just t)) = do
-        _ <- loop ctx t
-
+    loop ctx e@(Merge kvsX kvsY mT₁) = do
         tKvsX <- fmap Dhall.Core.normalize (loop ctx kvsX)
-        ktsX  <- case tKvsX of
+
+        ktsX <- case tKvsX of
             Record kts -> return kts
             _          -> Left (TypeError ctx e (MustMergeARecord kvsX tKvsX))
-        let ksX = Data.Set.fromList (Dhall.Map.keys ktsX)
 
         tKvsY <- fmap Dhall.Core.normalize (loop ctx kvsY)
-        ktsY  <- case tKvsY of
+
+        ktsY <- case tKvsY of
             Union kts -> return kts
             _         -> Left (TypeError ctx e (MustMergeUnion kvsY tKvsY))
+
+        let ksX = Data.Set.fromList (Dhall.Map.keys ktsX)
         let ksY = Data.Set.fromList (Dhall.Map.keys ktsY)
 
         let diffX = Data.Set.difference ksX ksY
@@ -709,69 +708,69 @@ typeWithA tpa = loop
             then return ()
             else Left (TypeError ctx e (UnusedHandler diffX))
 
-        let process (kY, tY) = do
+        (mKX, _T₁) <- do
+            case mT₁ of
+                Just _T₁ -> do
+                    return (Nothing, _T₁)
+
+                Nothing -> do
+                    case Dhall.Map.uncons ktsX of
+                        Nothing -> do
+                            Left (TypeError ctx e MissingMergeType)
+
+                        Just (kX, tX, _) -> do
+                            _T₁ <- do
+                                case Dhall.Map.lookup kX ktsY of
+                                    Nothing -> do
+                                        Left (TypeError ctx e (UnusedHandler diffX))
+
+                                    Just Nothing -> do
+                                        return tX
+
+                                    Just (Just _)  ->
+                                        case tX of
+                                            Pi x _A₀ _T₀ -> do
+                                                return (Dhall.Core.shift (-1) (V x 0) _T₀)
+                                            _ -> do
+                                                Left (TypeError ctx e (HandlerNotAFunction kX tX))
+
+                            return (Just kX, _T₁)
+
+        _ <- loop ctx _T₁
+
+        let process kY mTY = do
                 case Dhall.Map.lookup kY ktsX of
-                    Nothing  -> Left (TypeError ctx e (MissingHandler diffY))
-                    Just tX  ->
-                        case tX of
-                            Pi y tY' t' -> do
-                                if Dhall.Core.judgmentallyEqual tY tY'
-                                    then return ()
-                                    else Left (TypeError ctx e (HandlerInputTypeMismatch kY tY tY'))
-                                let t'' = Dhall.Core.shift (-1) (V y 0) t'
-                                if Dhall.Core.judgmentallyEqual t t''
-                                    then return ()
-                                    else Left (TypeError ctx e (InvalidHandlerOutputType kY t t''))
-                            _ -> Left (TypeError ctx e (HandlerNotAFunction kY tX))
-        mapM_ process (Dhall.Map.toList ktsY)
-        return t
-    loop ctx e@(Merge kvsX kvsY Nothing) = do
-        tKvsX <- fmap Dhall.Core.normalize (loop ctx kvsX)
-        ktsX  <- case tKvsX of
-            Record kts -> return kts
-            _          -> Left (TypeError ctx e (MustMergeARecord kvsX tKvsX))
-        let ksX = Data.Set.fromList (Dhall.Map.keys ktsX)
+                    Nothing -> do
+                        Left (TypeError ctx e (MissingHandler diffY))
 
-        tKvsY <- fmap Dhall.Core.normalize (loop ctx kvsY)
-        ktsY  <- case tKvsY of
-            Union kts -> return kts
-            _         -> Left (TypeError ctx e (MustMergeUnion kvsY tKvsY))
-        let ksY = Data.Set.fromList (Dhall.Map.keys ktsY)
+                    Just tX -> do
+                        _T₃ <- do
+                            case mTY of
+                                Nothing -> do
+                                    return tX
+                                Just _A₁ -> do
+                                    case tX of
+                                        Pi x _A₀ _T₂ -> do
+                                            if Dhall.Core.judgmentallyEqual _A₀ _A₁
+                                                then return ()
+                                                else Left (TypeError ctx e (HandlerInputTypeMismatch kY _A₁ _A₀))
 
-        let diffX = Data.Set.difference ksX ksY
-        let diffY = Data.Set.difference ksY ksX
+                                            return (Dhall.Core.shift (-1) (V x 0) _T₂)
+                                        _ -> do
+                                            Left (TypeError ctx e (HandlerNotAFunction kY tX))
 
-        if Data.Set.null diffX
-            then return ()
-            else Left (TypeError ctx e (UnusedHandler diffX))
+                        if Dhall.Core.judgmentallyEqual _T₁ _T₃
+                            then return ()
+                            else
+                                case mKX of
+                                    Nothing -> do
+                                        Left (TypeError ctx e (InvalidHandlerOutputType kY _T₁ _T₃))
+                                    Just kX -> do
+                                        Left (TypeError ctx e (HandlerOutputTypeMismatch kX _T₁ kY _T₃))
 
-        (kX, t) <- case Dhall.Map.toList ktsX of
-            []               -> Left (TypeError ctx e MissingMergeType)
-            (kX, Pi y _ t):_ -> return (kX, Dhall.Core.shift (-1) (V y 0) t)
-            (kX, tX      ):_ -> Left (TypeError ctx e (HandlerNotAFunction kX tX))
-        let process (kY, tY) = do
-                case Dhall.Map.lookup kY ktsX of
-                    Nothing  -> Left (TypeError ctx e (MissingHandler diffY))
-                    Just tX  ->
-                        case tX of
-                            Pi y tY' t' -> do
-                                if Dhall.Core.judgmentallyEqual tY tY'
-                                    then return ()
-                                    else Left (TypeError ctx e (HandlerInputTypeMismatch kY tY tY'))
-                                let t'' = Dhall.Core.shift (-1) (V y 0) t'
-                                if Dhall.Core.judgmentallyEqual t t''
-                                    then return ()
-                                    else Left (TypeError ctx e (HandlerOutputTypeMismatch kX t kY t''))
-                            _ -> Left (TypeError ctx e (HandlerNotAFunction kY tX))
-        mapM_ process (Dhall.Map.toList ktsY)
-        return t
-    loop ctx e@(Constructors t  ) = do
-        _ <- loop ctx t
+        Dhall.Map.unorderedTraverseWithKey_ process ktsY
 
-        case Dhall.Core.normalize t of
-            u@(Union _) -> loop ctx u
-            t'          -> Left (TypeError ctx e (ConstructorsRequiresAUnionType t t'))
-
+        return _T₁
     loop ctx e@(Field r x       ) = do
         t <- fmap Dhall.Core.normalize (loop ctx r)
 
@@ -788,7 +787,8 @@ typeWithA tpa = loop
                 case Dhall.Core.normalize r of
                   Union kts ->
                     case Dhall.Map.lookup x kts of
-                        Just t' -> return (Pi x t' (Union kts))
+                        Just (Just t') -> return (Pi x t' (Union kts))
+                        Just Nothing   -> return (Union kts)
                         Nothing -> Left (TypeError ctx e (MissingField x t))
                   r' -> Left (TypeError ctx e (CantAccess text r' t))
             _ -> do
@@ -840,6 +840,12 @@ instance Data X where
 instance Pretty X where
     pretty = absurd
 
+instance FromTerm X where
+    decode _ = empty
+
+instance ToTerm X where
+    encode = absurd
+
 -- | The specific type error
 data TypeMessage s a
     = UnboundVariable Text
@@ -865,6 +871,7 @@ data TypeMessage s a
     | FieldMismatch Text (Expr s a) Const Text (Expr s a) Const
     | InvalidAlternative Text (Expr s a)
     | InvalidAlternativeType Text (Expr s a)
+    | AlternativeAnnotationMismatch Text (Expr s a) Const Text (Expr s a) Const
     | ListAppendMismatch (Expr s a) (Expr s a)
     | DuplicateAlternative Text
     | MustCombineARecord Char (Expr s a) (Expr s a)
@@ -897,13 +904,13 @@ data TypeMessage s a
     | NoDependentTypes (Expr s a) (Expr s a)
     deriving (Show)
 
-shortTypeMessage :: (Eq a, Pretty a) => TypeMessage s a -> Doc Ann
+shortTypeMessage :: (Eq a, Pretty a, ToTerm a) => TypeMessage s a -> Doc Ann
 shortTypeMessage msg =
     "\ESC[1;31mError\ESC[0m: " <> short <> "\n"
   where
     ErrorMessages {..} = prettyTypeMessage msg
 
-longTypeMessage :: (Eq a, Pretty a) => TypeMessage s a -> Doc Ann
+longTypeMessage :: (Eq a, Pretty a, ToTerm a) => TypeMessage s a -> Doc Ann
 longTypeMessage msg =
         "\ESC[1;31mError\ESC[0m: " <> short <> "\n"
     <>  "\n"
@@ -922,13 +929,13 @@ _NOT :: Doc ann
 _NOT = "\ESC[1mnot\ESC[0m"
 
 insert :: Pretty a => a -> Doc Ann
-insert expression =
-    "↳ " <> Pretty.align (Dhall.Util.snipDoc (Pretty.pretty expression))
+insert = Dhall.Util.insert
 
-prettyDiff :: (Eq a, Pretty a) => Expr s a -> Expr s a -> Doc Ann
+prettyDiff :: (Eq a, Pretty a, ToTerm a) => Expr s a -> Expr s a -> Doc Ann
 prettyDiff exprL exprR = Dhall.Diff.diffNormalized exprL exprR
 
-prettyTypeMessage :: (Eq a, Pretty a) => TypeMessage s a -> ErrorMessages
+prettyTypeMessage
+    :: (Eq a, Pretty a, ToTerm a) => TypeMessage s a -> ErrorMessages
 prettyTypeMessage (UnboundVariable x) = ErrorMessages {..}
   -- We do not need to print variable name here. For the discussion see:
   -- https://github.com/dhall-lang/dhall-haskell/pull/116
@@ -2308,69 +2315,7 @@ prettyTypeMessage (InvalidField k expr0) = ErrorMessages {..}
 
 prettyTypeMessage (InvalidAlternativeType k expr0) = ErrorMessages {..}
   where
-    short = "Invalid alternative"
-
-    long =
-        "Explanation: Every union literal begins by selecting one alternative and        \n\
-        \specifying the value for that alternative, like this:                           \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \        Select the ❰Left❱ alternative, whose value is ❰True❱                    \n\
-        \        ⇩                                                                       \n\
-        \    ┌──────────────────────────────────┐                                        \n\
-        \    │ < Left = True, Right : Natural > │  A union literal with two alternatives \n\
-        \    └──────────────────────────────────┘                                        \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \However, this value must be a term and not a type.  For example, the following  \n\
-        \values are " <> _NOT <> " valid:                                                \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \    ┌──────────────────────────────────┐                                        \n\
-        \    │ < Left = Text, Right : Natural > │  Invalid union literal                 \n\
-        \    └──────────────────────────────────┘                                        \n\
-        \               ⇧                                                                \n\
-        \               This is a type and not a term                                    \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \    ┌───────────────────────────────┐                                           \n\
-        \    │ < Left = Type, Right : Type > │  Invalid union type                       \n\
-        \    └───────────────────────────────┘                                           \n\
-        \               ⇧                                                                \n\
-        \               This is a kind and not a term                                    \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \Some common reasons why you might get this error:                               \n\
-        \                                                                                \n\
-        \● You accidentally typed ❰=❱ instead of ❰:❱ for a union literal with one        \n\
-        \  alternative:                                                                  \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \    ┌────────────────────┐                                                      \n\
-        \    │ < Example = Text > │                                                      \n\
-        \    └────────────────────┘                                                      \n\
-        \                ⇧                                                               \n\
-        \                This could be ❰:❱ instead                                       \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \────────────────────────────────────────────────────────────────────────────────\n\
-        \                                                                                \n\
-        \You provided a union literal with an alternative named:                         \n\
-        \                                                                                \n\
-        \" <> txt0 <> "\n\
-        \                                                                                \n\
-        \... whose value is:                                                             \n\
-        \                                                                                \n\
-        \" <> txt1 <> "\n\
-        \                                                                                \n\
-        \... which is not a term                                                         \n"
-      where
-        txt0 = insert k
-        txt1 = insert expr0
-
-prettyTypeMessage (InvalidAlternative k expr0) = ErrorMessages {..}
-  where
-    short = "Invalid alternative"
+    short = "Invalid alternative type"
 
     long =
         "Explanation: Every union type specifies the type of each alternative, like this:\n\
@@ -2385,22 +2330,16 @@ prettyTypeMessage (InvalidAlternative k expr0) = ErrorMessages {..}
         \                             The type of the second alternative is ❰Natural❱    \n\
         \                                                                                \n\
         \                                                                                \n\
-        \However, these alternatives can only be annotated with types.  For example, the \n\
-        \following union types are " <> _NOT <> " valid:                                 \n\
+        \However, these alternatives can only be annotated with ❰Type❱s, ❰Kind❱s, or     \n\
+        \❰Sort❱s.  For example, the following union types are " <> _NOT <> " valid:      \n\
         \                                                                                \n\
         \                                                                                \n\
         \    ┌────────────────────────────┐                                              \n\
         \    │ < Left : Bool, Right : 1 > │  Invalid union type                          \n\
         \    └────────────────────────────┘                                              \n\
         \                             ⇧                                                  \n\
-        \                             This is a term and not a type                      \n\
-        \                                                                                \n\
-        \                                                                                \n\
-        \    ┌───────────────────────────────┐                                           \n\
-        \    │ < Left : Bool, Right : Type > │  Invalid union type                       \n\
-        \    └───────────────────────────────┘                                           \n\
-        \                             ⇧                                                  \n\
-        \                             This is a kind and not a type                      \n\
+        \                             This is a ❰Natural❱ and not a ❰Type❱, ❰Kind❱, or   \n\
+        \                             ❰Sort❱                                             \n\
         \                                                                                \n\
         \                                                                                \n\
         \Some common reasons why you might get this error:                               \n\
@@ -2421,12 +2360,119 @@ prettyTypeMessage (InvalidAlternative k expr0) = ErrorMessages {..}
         \                                                                                \n\
         \" <> txt0 <> "\n\
         \                                                                                \n\
-        \... annotated with the following expression which is not a type:                \n\
+        \... annotated with the following expression which is not a ❰Type❱, ❰Kind❱, or   \n\
+        \❰Sort❱:                                                                         \n\
         \                                                                                \n\
         \" <> txt1 <> "\n"
       where
         txt0 = insert k
         txt1 = insert expr0
+
+prettyTypeMessage (InvalidAlternative k expr0) = ErrorMessages {..}
+  where
+    short = "Invalid alternative"
+
+    long =
+        "Explanation: Every union literal begins by selecting one alternative and        \n\
+        \specifying the value for that alternative, like this:                           \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \        Select the ❰Left❱ alternative, whose value is ❰True❱                    \n\
+        \        ⇩                                                                       \n\
+        \    ┌──────────────────────────────────┐                                        \n\
+        \    │ < Left = True, Right : Natural > │  A union literal with two alternatives \n\
+        \    └──────────────────────────────────┘                                        \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \However, this value must be a term, type, or kind.  For example, the following  \n\
+        \values are " <> _NOT <> " valid:                                                \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \    ┌─────────────────┐                                                         \n\
+        \    │ < Left = Sort > │  Invalid union literal                                  \n\
+        \    └─────────────────┘                                                         \n\
+        \               ⇧                                                                \n\
+        \               This is not a term, type, or kind                                \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \────────────────────────────────────────────────────────────────────────────────\n\
+        \                                                                                \n\
+        \You provided a union literal with an alternative named:                         \n\
+        \                                                                                \n\
+        \" <> txt0 <> "\n\
+        \                                                                                \n\
+        \... whose value is:                                                             \n\
+        \                                                                                \n\
+        \" <> txt1 <> "\n\
+        \                                                                                \n\
+        \... which is not a term, type, or kind.                                         \n"
+      where
+        txt0 = insert k
+        txt1 = insert expr0
+
+prettyTypeMessage (AlternativeAnnotationMismatch k0 expr0 c0 k1 expr1 c1) = ErrorMessages {..}
+  where
+    short = "Alternative annotation mismatch"
+
+    long =
+        "Explanation: Every union type annotates each alternative with a ❰Type❱ or a     \n\
+        \❰Kind❱, like this:                                                              \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \    ┌───────────────────────────────────┐                                       \n\
+        \    │ < Left : Natural | Right : Bool > │  Every alternative is annotated with a\n\
+        \    └───────────────────────────────────┘  ❰Type❱                               \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \    ┌────────────────────────────────────┐                                      \n\
+        \    │ < Foo : Type → Type | Bar : Type > │  Every alternative is annotated with \n\
+        \    └────────────────────────────────────┘  a ❰Kind❱                            \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \    ┌────────────────┐                                                          \n\
+        \    │ < Baz : Kind > │  Every alternative is annotated with a ❰Sort❱            \n\
+        \    └────────────────┘                                                          \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \However, you cannot have a union type that mixes ❰Type❱s, ❰Kind❱s, or ❰Sort❱s   \n\
+        \for the annotations:                                                            \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \              This is a ❰Type❱ annotation                                       \n\
+        \              ⇩                                                                 \n\
+        \    ┌───────────────────────────────┐                                           \n\
+        \    │ { foo : Natural, bar : Type } │  Invalid union type                       \n\
+        \    └───────────────────────────────┘                                           \n\
+        \                             ⇧                                                  \n\
+        \                             ... but this is a ❰Kind❱ annotation                \n\
+        \                                                                                \n\
+        \                                                                                \n\
+        \You provided a union type with an alternative named:                            \n\
+        \                                                                                \n\
+        \" <> txt0 <> "\n\
+        \                                                                                \n\
+        \... annotated with the following expression:                                    \n\
+        \                                                                                \n\
+        \" <> txt1 <> "\n\
+        \                                                                                \n\
+        \... which is a " <> level c0 <> " whereas another alternative named:            \n\
+        \                                                                                \n\
+        \" <> txt2 <> "\n\
+        \                                                                                \n\
+        \... annotated with the following expression:                                    \n\
+        \                                                                                \n\
+        \" <> txt3 <> "\n\
+        \                                                                                \n\
+        \... is a " <> level c1 <> ", which does not match                               \n"
+      where
+        txt0 = insert k0
+        txt1 = insert expr0
+        txt2 = insert k1
+        txt3 = insert expr1
+
+        level Type = "❰Type❱"
+        level Kind = "❰Kind❱"
+        level Sort = "❰Sort❱"
 
 prettyTypeMessage (ListAppendMismatch expr0 expr1) = ErrorMessages {..}
   where
@@ -3426,7 +3472,7 @@ prettyTypeMessage (CantEQ expr0 expr1) =
         buildBooleanOperator "==" expr0 expr1
 
 prettyTypeMessage (CantNE expr0 expr1) =
-        buildBooleanOperator "/=" expr0 expr1
+        buildBooleanOperator "!=" expr0 expr1
 
 prettyTypeMessage (CantInterpolate expr0 expr1) = ErrorMessages {..}
   where
@@ -3707,12 +3753,12 @@ data TypeError s a = TypeError
     , typeMessage :: TypeMessage s a
     }
 
-instance (Eq a, Pretty s, Pretty a) => Show (TypeError s a) where
+instance (Eq a, Pretty s, Pretty a, ToTerm a) => Show (TypeError s a) where
     show = Pretty.renderString . Pretty.layoutPretty layoutOpts . Pretty.pretty
 
-instance (Eq a, Pretty s, Pretty a, Typeable s, Typeable a) => Exception (TypeError s a)
+instance (Eq a, Pretty s, Pretty a, ToTerm a, Typeable s, Typeable a) => Exception (TypeError s a)
 
-instance (Eq a, Pretty s, Pretty a) => Pretty (TypeError s a) where
+instance (Eq a, Pretty s, Pretty a, ToTerm a) => Pretty (TypeError s a) where
     pretty (TypeError ctx expr msg)
         = Pretty.unAnnotate
             (   "\n"
@@ -3743,12 +3789,12 @@ instance (Eq a, Pretty s, Pretty a) => Pretty (TypeError s a) where
 newtype DetailedTypeError s a = DetailedTypeError (TypeError s a)
     deriving (Typeable)
 
-instance (Eq a, Pretty s, Pretty a) => Show (DetailedTypeError s a) where
+instance (Eq a, Pretty s, Pretty a, ToTerm a) => Show (DetailedTypeError s a) where
     show = Pretty.renderString . Pretty.layoutPretty layoutOpts . Pretty.pretty
 
-instance (Eq a, Pretty s, Pretty a, Typeable s, Typeable a) => Exception (DetailedTypeError s a)
+instance (Eq a, Pretty s, Pretty a, ToTerm a, Typeable s, Typeable a) => Exception (DetailedTypeError s a)
 
-instance (Eq a, Pretty s, Pretty a) => Pretty (DetailedTypeError s a) where
+instance (Eq a, Pretty s, Pretty a, ToTerm a) => Pretty (DetailedTypeError s a) where
     pretty (DetailedTypeError (TypeError ctx expr msg))
         = Pretty.unAnnotate
             (   "\n"

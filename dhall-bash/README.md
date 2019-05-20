@@ -1,4 +1,14 @@
-# `dhall-bash 1.0.17`
+# `dhall-bash`
+
+For installation or development instructions, see:
+
+* [`dhall-haskell` - `README`](https://github.com/dhall-lang/dhall-haskell/blob/master/README.md)
+
+Full documentation here:
+
+* [`dhall-bash` instructions](https://hackage.haskell.org/package/dhall-bash/docs/Dhall-Bash.html)
+
+## Introduction
 
 This `dhall-bash` package provides a Dhall to Bash compiler so that you can
 easily marshall Dhall values into your Bash scripts

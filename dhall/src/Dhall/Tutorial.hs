@@ -65,6 +65,9 @@ module Dhall.Tutorial (
     -- ** Caveats
     -- $caveats
 
+    -- ** Extending the language
+    -- $extending
+
     -- ** Overview
     -- $builtinOverview
 
@@ -314,7 +317,7 @@ import Dhall
 -- - Bool
 -- + Natural
 -- ...
--- 1 : Bool
+-- 1: 1 : Bool
 -- ...
 -- (input):1:1
 -- ...
@@ -426,6 +429,7 @@ import Dhall
 --   ↳ ./file2
 -- ...
 -- Cyclic import: ./file1
+-- ...
 --
 -- You can also import expressions by URL.  For example, you can find a Dhall
 -- expression hosted at this GitHub URL:
@@ -476,7 +480,7 @@ import Dhall
 -- *** Exception: 
 -- ↳ ./baz: 
 -- ...
--- ...Error...: Missing file .../baz:
+-- ...Error...: Missing file ...baz:
 -- ...
 --
 -- This is because the parser thinks that @./baz:@ is a single token due to
@@ -513,7 +517,8 @@ import Dhall
 -- *** Exception:
 -- ...Error...: An empty list requires a type annotation
 -- ...
--- []
+-- 1: []
+-- ...
 -- (input):1:1
 --
 -- Also, list elements must all have the same type.  You will get an error if
@@ -526,7 +531,7 @@ import Dhall
 -- - Natural
 -- + Bool
 -- ...
---     True
+-- 1:     True
 -- ...
 -- (input):1:5
 -- ...
@@ -1059,18 +1064,36 @@ import Dhall
 -- the @Natural@ alternative and the @Right@ tag is used for the @Bool@
 -- alternative.
 --
--- A union literal specifies the value of one alternative and the types of the
--- remaining alternatives.  For example, both of the following union literals
--- have the same type, which is the above union type:
+-- You can specify the value of a union constructor like this:
 --
--- > < Left  = 0    | Right : Bool    >
+-- > let Union = < Left : Natural | Right : Bool>
+-- > 
+-- > [ Union.Left 0, Union.Right True ] : List Union
 --
--- > < Right = True | Left  : Natural >
+-- In other words, you can access a union constructor as a field of a union
+-- type and use that constructor to wrap a value of a type appropriate for
+-- that alternative.  In the above example, the @Left@ constructor can wrap
+-- a @Natural@ value and the @Right@ constructor can wrap a @Bool@ value.  We
+-- can also confirm that by inspecting their type:
+--
+-- > $ echo '< Left : Natural | Right : Bool>' > ./Union
+--
+-- > $ dhall --annotate <<< '(./Union).Left'
+-- >   < Left : Natural | Right : Bool >.Left
+-- > : ∀(Left : Natural) → < Left : Natural | Right : Bool >
+--
+-- > $ dhall --annotate <<< '(./Union).Right'
+-- >   < Left : Natural | Right : Bool >.Right
+-- > : ∀(Right : Bool) → < Left : Natural | Right : Bool >
+--
+-- In other words, the @Left@ constructor is a function from a @Natural@ to a
+-- value of our @Union@ type and the @Right@ constructor is a separate function
+-- from a @Bool@ to that same @Union@ type.
 --
 -- You can consume a union using the built-in @merge@ function.  For example,
 -- suppose we want to convert our union to a @Bool@ but we want to behave
 -- differently depending on whether or not the union is a @Natural@ wrapped in
--- the @Left@ alternative or a @Bool@ wrapped in the @Right@ alternative.  We
+-- the @Left@ constructor or a @Bool@ wrapped in the @Right@ constructor .  We
 -- would write:
 --
 -- > $ cat > process <<EOF
@@ -1084,18 +1107,10 @@ import Dhall
 --
 -- Now our @./process@ function can handle both alternatives:
 --
--- > $ dhall
--- > ./process < Left = 3 | Right : Bool >
--- > <Ctrl-D>
--- > Bool
--- > 
+-- > $ dhall <<< './process ((./Union).Left 3)'
 -- > False
 --
--- > $ dhall
--- > ./process < Right = True | Left : Natural >
--- > <Ctrl-D>
--- > Bool
--- > 
+-- > $ dhall <<< './process ((./Union).Right True)'
 -- > True
 --
 -- Every @merge@ has the following form:
@@ -1111,86 +1126,54 @@ import Dhall
 -- The @merge@ function selects which function to apply from the record based on
 -- which alternative the union selects:
 --
--- > merge { Foo = f, ... } < Foo = x | ... > : t = f x : t
+-- > merge { Foo = f, ... } (< … >.Foo x) = f x
 --
 -- So, for example:
 --
--- > merge { Left = Natural/even, Right = λ(b : Bool) → b } < Left = 3 | Right : Bool > : Bool
--- >     = Natural/even 3 : Bool
+-- > merge { Left = Natural/even, Right = λ(b : Bool) → b } (< Left : Natural | Right : Bool >.Left 3)
+-- >     = Natural/even 3
 -- >     = False
 --
 -- ... and similarly:
 --
--- > merge { Left = Natural/even, Right = λ(b : Bool) → b } < Right = True | Left : Natural > : Bool
--- >     = (λ(b : Bool) → b) True : Bool
+-- > merge { Left = Natural/even, Right = λ(b : Bool) → b } (< Left : Natural | Right : Bool >.Right True)
+-- >     = (λ(b : Bool) → b) True
 -- >     = True
 --
 -- Notice that each handler has to return the same type of result (@Bool@ in
--- this case) which must also match the declared result type of the @merge@.
+-- this case).
 --
--- You can also omit the type annotation when merging a union with one or more
--- alternatives, like this:
---
--- > merge { Left = Natural/even, Right = λ(b : Bool) → b } < Right = True | Left : Natural >
---
--- You can also store more than one value or less than one value within
--- alternatives using Dhall's support for anonymous records.  You can nest an
--- anonymous record within a union such as in this type:
+-- You can also store more than one value within alternatives using Dhall's
+-- support for anonymous records.  You can nest an anonymous record within a
+-- union such as in this type:
 --
 -- > < Empty : {} | Person : { name : Text, age : Natural } >
+--
+-- You can even go a step further and omit the type of an alternative if it
+-- stores no data, like this:
+--
+-- > < Empty | Person : { name : Text, age : Natural } >
+--
 --
 -- This union of records resembles following equivalent Haskell data type:
 --
 -- > data Example = Empty | Person { name :: Text, age :: Text }
 --
--- You can resemble Haskell further by defining convenient constructors for each
--- alternative, like this:
+-- Empty alternatives like @Empty@ require no argument:
 --
--- >     let Empty  = < Empty = {=} | Person : { name : Text, age : Natural } >
--- > in  let Person =
--- >         λ(p : { name : Text, age : Natural }) → < Person = p | Empty : {} >
--- > in  [   Empty
--- >     ,   Person { name = "John", age = 23 }
--- >     ,   Person { name = "Amy" , age = 25 }
--- >     ,   Empty
--- >     ]
---
--- ... and Dhall even provides the @constructors@ keyword to automate this
--- common pattern:
---
--- >     let MyType = constructors < Empty : {} | Person : { name : Text, age : Natural } >
--- > in  [   MyType.Empty {=}
+-- > let MyType = < Empty | Person : { name : Text, age : Natural } >
+-- > 
+-- > in  [   MyType.Empty  -- Note the absence of any argument to `Empty`
 -- >     ,   MyType.Person { name = "John", age = 23 }
 -- >     ,   MyType.Person { name = "Amy" , age = 25 }
 -- >     ]
 --
--- The @constructors@ keyword takes a union type argument and returns a record
--- with one field per union type constructor:
+-- ... and when you @merge@ an empty alternative the correspond handler takes no
+-- argument:
 --
--- > $ dhall
--- > constructors < Empty : {} | Person : { name : Text, age : Natural } >
--- > <Ctrl-D>
--- >
--- > { Empty  :
--- >     ∀(Empty : {}) → < Empty : {} | Person : { age : Natural, name : Text } >
--- > , Person :
--- >       ∀(Person : { age : Natural, name : Text })
--- >     → < Empty : {} | Person : { age : Natural, name : Text } >
--- > }
--- >
--- > { Empty  =
--- >     λ(Empty : {}) → < Empty = Empty | Person : { age : Natural, name : Text } >
--- > , Person =
--- >       λ(Person : { age : Natural, name : Text })
--- >     → < Person = Person | Empty : {} >
--- > }
---
--- You can also extract fields during pattern matching such as in the following
--- function which renders each value to `Text`:
---
--- >     λ(x : < Empty : {} | Person : { name : Text, age : Natural } >)
+-- >     λ(x : < Empty | Person : { name : Text, age : Natural } >)
 -- > →   merge
--- >     {   Empty = λ(_ : {}) → "Unknown"
+-- >     {   Empty = "Unknown"  -- Note the absence of a `λ`
 -- >
 -- >     ,   Person =
 -- >             λ(person : { name : Text, age : Natural })
@@ -1628,7 +1611,7 @@ import Dhall
 -- > z) (y.diff (n + List/length { index : Natural, value : a } kvs)) }) { count = 
 -- > 0, diff = λ(_ : Natural) → nil }).diff 0)
 --
--- ... and run the expression through the the formatter:
+-- ... and run the expression through the formatter:
 --
 -- > $ dhall format < ./unformatted
 -- >   λ(a : Type)
@@ -1839,6 +1822,92 @@ import Dhall
 --
 -- Second, the equality @(==)@ and inequality @(!=)@ operators only work on
 -- @Bool@s.  You cannot test any other types of values for equality.
+--
+-- However, you can extend the language with your own built-ins using the
+-- Haskell API, as described in the next section.
+
+-- $extending
+--
+-- You can use the Haskell API to extend the Dhall configuration language with
+-- new built-in functions.  This section contains a simple Haskell recipe to add
+-- a new @Natural/equal@ built-in function of type:
+--
+-- > Natural/equal : Natural → Natural → Bool
+--
+-- To do so, we:
+-- 
+-- * extend the type-checking context to include the type of @Natural/equal@
+-- * extend the normalizer to evaluate all occurrences of @Natural/equal@
+--
+-- ... like this:
+--
+-- > -- example.hs
+-- > 
+-- > {-# LANGUAGE OverloadedStrings #-}
+-- > 
+-- > module Main where
+-- > 
+-- > import Dhall.Core (Expr(..), ReifiedNormalizer(..))
+-- > 
+-- > import qualified Data.Text.IO
+-- > import qualified Dhall
+-- > import qualified Dhall.Context
+-- > import qualified Lens.Family   as Lens
+-- > 
+-- > main :: IO ()
+-- > main = do
+-- >     text <- Data.Text.IO.getContents
+-- > 
+-- >     let startingContext = transform Dhall.Context.empty
+-- >           where
+-- >             transform = Dhall.Context.insert "Natural/equal" naturalEqualType
+-- > 
+-- >             naturalEqualType =
+-- >                 Pi "_" Natural (Pi "_" Natural Bool)
+-- > 
+-- >     let normalizer (App (App (Var "Natural/equal") (NaturalLit x)) (NaturalLit y)) =
+-- >             Just (BoolLit (x == y))
+-- >         normalizer _ =
+-- >             Nothing
+-- > 
+-- >     let inputSettings = transform Dhall.defaultInputSettings
+-- >           where
+-- >             transform =
+-- >                   Lens.set Dhall.normalizer      (ReifiedNormalizer (pure . normalizer))
+-- >                 . Lens.set Dhall.startingContext startingContext
+-- > 
+-- >     x <- Dhall.inputWithSettings inputSettings Dhall.auto text
+-- > 
+-- >     Data.Text.IO.putStrLn x
+--
+-- Here is an example use of the above program:
+--
+-- > $ ./example <<< 'if Natural/equal 2 (1 + 1) then "Equal" else "Not equal"'
+-- > Equal
+--
+-- Note that existing Dhall tools that type-check expressions will reject
+-- expressions containing unexpected free variable such as @Natural/equal@:
+--
+-- > $ dhall <<< 'Natural/equal 2 (1 + 1)'
+-- > 
+-- > Use "dhall --explain" for detailed errors
+-- > 
+-- > Error: Unbound variable
+-- > 
+-- > Natural/equal 
+-- > 
+-- > (stdin):1:1
+--
+-- You will need to either:
+-- 
+-- * create your own parallel versions of these tools, or:
+-- * < https://github.com/dhall-lang/dhall-lang/blob/master/.github/CONTRIBUTING.md#how-do-i-change-the-language try to upstream your built-ins into the language>
+-- 
+-- The general guidelines for adding new built-ins to the language are:
+-- 
+-- * Keep built-ins easy to implement across language bindings
+-- * Prefer general purpose built-ins or built-ins appropriate for the task of program configuration
+-- * Design built-ins to catch errors as early as possible (i.e. when type-checking the configuration)
 
 -- $builtinOverview
 --

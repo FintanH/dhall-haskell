@@ -1,3 +1,32 @@
+1.2.8
+
+* New `json-to-dhall` command-line utility
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/884
+* `--omitEmpty` now also omits empty arrays
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/872
+* Build against `dhall-1.22.0`
+* Improved error messages:
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/895
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/900
+
+1.2.7
+
+* Build against `dhall-1.21.0`
+* Support GHC 7.10.3
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/814
+* Add new `--omitEmpty` flag for omitting nulls and empty records
+
+1.2.6
+
+* Add `--version` flag
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/704
+* Build against `tasty-1.2`
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/731
+* Add `--compact` flag to `dhall-to-json`
+    * Eventually `--pretty` will become the default, so this flag provides a
+      way for a user to preserve the old 1-line output when that happens
+    * See: https://github.com/dhall-lang/dhall-haskell/pull/743
+
 1.2.5
 
 * Build against `dhall-1.19.0`

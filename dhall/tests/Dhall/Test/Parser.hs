@@ -3,182 +3,143 @@
 module Dhall.Test.Parser where
 
 import Data.Text (Text)
+import Dhall.Core (Expr, Import)
+import Dhall.TypeCheck (X)
+import Prelude hiding (FilePath)
 import Test.Tasty (TestTree)
+import Turtle (FilePath, (</>))
 
-import qualified Control.Exception
-import qualified Data.Text
-import qualified Data.Text.IO
-import qualified Dhall.Parser
-import qualified Test.Tasty
-import qualified Test.Tasty.HUnit
+import qualified Codec.Serialise      as Serialise
+import qualified Control.Monad        as Monad
+import qualified Data.ByteString.Lazy as ByteString.Lazy
+import qualified Data.Text            as Text
+import qualified Data.Text.IO         as Text.IO
+import qualified Dhall.Binary         as Binary
+import qualified Dhall.Core           as Core
+import qualified Dhall.Parser         as Parser
+import qualified Dhall.Test.Util      as Test.Util
+import qualified Test.Tasty           as Tasty
+import qualified Test.Tasty.HUnit     as Tasty.HUnit
+import qualified Turtle
 
-tests :: TestTree
-tests =
-    Test.Tasty.testGroup "parser tests"
-        [ Test.Tasty.testGroup "whitespace"
-            [ shouldParse
-                "prefix/suffix"
-                "./tests/parser/success/whitespace"
-            , shouldParse
-                "block comment"
-                "./tests/parser/success/blockComment"
-            , shouldParse
-                "nested block comment"
-                "./tests/parser/success/nestedBlockComment"
-            , shouldParse
-                "line comment"
-                "./tests/parser/success/lineComment"
-            , shouldParse
-                "Unicode comment"
-                "./tests/parser/success/unicodeComment"
-            , shouldParse
-                "whitespace buffet"
-                "./tests/parser/success/whitespaceBuffet"
-            ]
-        , shouldParse
-            "label"
-            "./tests/parser/success/label"
-        , shouldParse
-            "quoted label"
-            "./tests/parser/success/quotedLabel"
-        , shouldParse
-            "double quoted string"
-            "./tests/parser/success/doubleQuotedString"
-        , shouldParse
-            "Unicode double quoted string"
-            "./tests/parser/success/unicodeDoubleQuotedString"
-        , shouldParse
-            "escaped double quoted string"
-            "./tests/parser/success/escapedDoubleQuotedString"
-        , shouldParse
-            "interpolated double quoted string"
-            "./tests/parser/success/interpolatedDoubleQuotedString"
-        , shouldParse
-            "single quoted string"
-            "./tests/parser/success/singleQuotedString"
-        , shouldParse
-            "escaped single quoted string"
-            "./tests/parser/success/escapedSingleQuotedString"
-        , shouldParse
-            "interpolated single quoted string"
-            "./tests/parser/success/interpolatedSingleQuotedString"
-        , shouldParse
-            "double"
-            "./tests/parser/success/double"
-        , shouldParse
-            "natural"
-            "./tests/parser/success/natural"
-        , shouldParse
-            "identifier"
-            "./tests/parser/success/identifier"
-        , shouldParse
-            "paths"
-            "./tests/parser/success/paths"
-        , shouldParse
-            "path termination"
-            "./tests/parser/success/pathTermination"
-        , shouldParse
-            "urls"
-            "./tests/parser/success/urls"
-        , shouldParse
-            "environmentVariables"
-            "./tests/parser/success/environmentVariables"
-        , shouldParse
-            "lambda"
-            "./tests/parser/success/lambda"
-        , shouldParse
-            "if then else"
-            "./tests/parser/success/ifThenElse"
-        , shouldParse
-            "let"
-            "./tests/parser/success/let"
-        , shouldParse
-            "forall"
-            "./tests/parser/success/forall"
-        , shouldParse
-            "function type"
-            "./tests/parser/success/functionType"
-        , shouldParse
-            "operators"
-            "./tests/parser/success/operators"
-        , shouldParse
-            "annotations"
-            "./tests/parser/success/annotations"
-        , shouldParse
-            "merge"
-            "./tests/parser/success/merge"
-        , shouldParse
-            "constructors"
-            "./tests/parser/success/constructors"
-        , shouldParse
-            "fields"
-            "./tests/parser/success/fields"
-        , shouldParse
-            "record"
-            "./tests/parser/success/record"
-        , shouldParse
-            "union"
-            "./tests/parser/success/union"
-        , shouldParse
-            "list"
-            "./tests/parser/success/list"
-        , shouldParse
-            "builtins"
-            "./tests/parser/success/builtins"
-        , shouldParse
-            "import alternatives"
-            "./tests/parser/success/importAlt"
-        , shouldParse
-            "large expression"
-            "./tests/parser/success/largeExpression"
-        , shouldParse
-            "names that begin with reserved identifiers"
-            "./tests/parser/success/reservedPrefix"
-        , shouldParse
-            "interpolated expressions with leading whitespace"
-            "./tests/parser/success/template"
-        , shouldParse
-            "collections with type annotations containing imports"
-            "./tests/parser/success/collectionImportType"
-        , shouldParse
-            "a parenthesized custom header import"
-            "./tests/parser/success/parenthesizeUsing"
-        , shouldNotParse
-            "accessing a field of an import without parentheses"
-            "./tests/parser/failure/importAccess.dhall"
-        , shouldParse
-            "Sort"
-            "./tests/parser/success/sort"
-        , shouldParse
-            "quoted path components"
-            "./tests/parser/success/quotedPaths"
-        , shouldNotParse
-            "positive double out of bounds"
-            "./tests/parser/failure/doubleBoundsPos.dhall"
-        , shouldNotParse
-            "negative double out of bounds"
-            "./tests/parser/failure/doubleBoundsNeg.dhall"
-        , shouldParse
-            "as Text"
-            "./tests/parser/success/asText"
-        , shouldParse
-            "custom headers"
-            "./tests/parser/success/customHeaders"
-        , shouldNotParse
-            "a multi-line literal without an initial newline"
-            "./tests/parser/failure/mandatoryNewline.dhall"
-        ]
+parseDirectory :: FilePath
+parseDirectory = "./dhall-lang/tests/parser"
 
-shouldParse :: Text -> FilePath -> TestTree
-shouldParse name path = Test.Tasty.HUnit.testCase (Data.Text.unpack name) (do
-    text <- Data.Text.IO.readFile (path <> "A.dhall")
-    case Dhall.Parser.exprFromText mempty text of
-        Left err -> Control.Exception.throwIO err
-        Right _  -> return () )
+binaryDecodeDirectory :: FilePath
+binaryDecodeDirectory = "./dhall-lang/tests/binary-decode"
 
-shouldNotParse :: Text -> FilePath -> TestTree
-shouldNotParse name path = Test.Tasty.HUnit.testCase (Data.Text.unpack name) (do
-    text <- Data.Text.IO.readFile path
-    case Dhall.Parser.exprFromText mempty text of
-        Left  _ -> return ()
-        Right _ -> fail "Unexpected successful parser" )
+getTests :: IO TestTree
+getTests = do
+    let successFiles = do
+            path <- Turtle.lstree (parseDirectory </> "success")
+
+            let skip =
+                    -- This is a bug created by a parsing performance
+                    -- improvement
+                    [ parseDirectory </> "success/unit/MergeParenAnnotationA.dhall"
+                    ]
+
+            Monad.guard (path `notElem` skip)
+
+            return path
+
+    successTests <- do
+        Test.Util.discover (Turtle.chars <* "A.dhall") shouldParse successFiles
+
+    let failureFiles = do
+            path <- Turtle.lstree (parseDirectory </> "failure")
+
+            let skip =
+                    [ -- These two unexpected successes are due to not correctly
+                      -- requiring non-empty whitespace after the `:` in a type
+                      -- annotatoin
+                      parseDirectory </> "failure/annotation.dhall"
+                    , parseDirectory </> "failure/unit/ImportEnvWrongEscape.dhall"
+
+                      -- Similarly, the implementation does not correctly
+                      -- require a space between a function and its argument
+                    , parseDirectory </> "failure/missingSpace.dhall"
+
+                      -- For parsing performance reasons the implementation
+                      -- treats a missing type annotation on an empty list as
+                      -- as a type-checking failure instead of a parse failure,
+                      -- but this might be fixable.
+                    , parseDirectory </> "failure/unit/ListLitEmptyAnnotation.dhall"
+                      -- The same performance improvements also broke the
+                      -- precedence of parsing empty list literals
+                    , parseDirectory </> "failure/unit/ListLitEmptyPrecedence.dhall"
+                    ]
+
+            Monad.guard (path `notElem` skip)
+
+            return path
+
+    failureTests <- do
+        Test.Util.discover (Turtle.chars <> ".dhall") shouldNotParse failureFiles
+
+    let binaryDecodeFiles =
+            Turtle.lstree (binaryDecodeDirectory </> "success")
+
+    binaryDecodeTests <- do
+        Test.Util.discover (Turtle.chars <* "A.dhallb") shouldDecode binaryDecodeFiles
+
+    let testTree =
+            Tasty.testGroup "parser tests"
+                [ successTests
+                , failureTests
+                , binaryDecodeTests
+                ]
+
+    return testTree
+
+shouldParse :: Text -> TestTree
+shouldParse path = do
+    let pathString = Text.unpack path
+
+    Tasty.HUnit.testCase pathString $ do
+        text <- Text.IO.readFile (pathString <> "A.dhall")
+
+        encoded <- ByteString.Lazy.readFile (pathString <> "B.dhallb")
+
+        expression <- Core.throws (Parser.exprFromText mempty text)
+
+        let term = Binary.encode expression
+
+        let bytes = Serialise.serialise term
+
+        let message = "The expected CBOR representation doesn't match the actual one"
+        Tasty.HUnit.assertEqual message encoded bytes
+
+shouldNotParse :: Text -> TestTree
+shouldNotParse path = do
+    let pathString = Text.unpack path
+
+    Tasty.HUnit.testCase pathString (do
+        text <- Text.IO.readFile pathString
+
+        case Parser.exprFromText mempty text of
+            Left  _ -> return ()
+            Right _ -> fail "Unexpected successful parser" )
+
+shouldDecode :: Text -> TestTree
+shouldDecode pathText = do
+    let pathString = Text.unpack pathText
+
+    Tasty.HUnit.testCase pathString (do
+        bytes <- ByteString.Lazy.readFile (pathString <> "A.dhallb")
+
+        term <- Core.throws (Serialise.deserialiseOrFail bytes)
+
+        decodedExpression <- Core.throws (Binary.decodeExpression term)
+
+        text <- Text.IO.readFile (pathString <> "B.dhall")
+
+        parsedExpression <- Core.throws (Parser.exprFromText mempty text)
+
+        let strippedExpression :: Expr X Import
+            strippedExpression = Core.denote parsedExpression
+
+        let message =
+                "The decoded expression didn't match the parsed expression"
+
+        Tasty.HUnit.assertEqual message decodedExpression strippedExpression )

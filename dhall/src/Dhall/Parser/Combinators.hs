@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP                        #-}
+{-# LANGUAGE DeriveAnyClass             #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE OverloadedStrings          #-}
@@ -6,6 +7,7 @@ module Dhall.Parser.Combinators where
 
 
 import           Control.Applicative        (Alternative (..), liftA2)
+import           Control.Exception          (Exception)
 import           Control.Monad              (MonadPlus (..))
 import           Data.Data                  (Data)
 import           Data.Semigroup             (Semigroup (..))
@@ -25,19 +27,38 @@ import qualified Data.Char
 import qualified Data.Sequence
 import qualified Data.Set
 import qualified Data.Text
+import qualified Data.Text.Prettyprint.Doc               as Pretty
+import qualified Data.Text.Prettyprint.Doc.Render.String as Pretty
 import qualified Dhall.Map
+import qualified Dhall.Pretty
 import qualified Dhall.Util
 import qualified Dhall.Set
 import qualified Text.Megaparsec
+#if !MIN_VERSION_megaparsec(7, 0, 0)
+import qualified Text.Megaparsec.Char as Text.Megaparsec (satisfy)
+#endif
 import qualified Text.Megaparsec.Char
 import qualified Text.Parser.Char
 import qualified Text.Parser.Combinators
 import qualified Text.Parser.Token.Style
+import qualified Text.Printf
 
 -- | Source code extract
 data Src = Src !Text.Megaparsec.SourcePos !Text.Megaparsec.SourcePos Text
   -- Text field is intentionally lazy
   deriving (Data, Eq, Show)
+
+data SourcedException e = SourcedException Src e
+
+instance Exception e => Exception (SourcedException e)
+
+instance Show e => Show (SourcedException e) where
+    show (SourcedException source exception) =
+            show exception
+        <>  "\n"
+        <>  "\n"
+        <>  Pretty.renderString
+                (Pretty.layoutPretty Dhall.Pretty.layoutOpts (pretty source))
 
 -- | Doesn't force the 'Text' part
 laxSrcEq :: Src -> Src -> Bool
@@ -51,13 +72,35 @@ laxSrcEq (Src p q _) (Src p' q' _) = eq p  p' && eq q q'
 
 instance Pretty Src where
     pretty (Src begin _ text) =
-            pretty (Dhall.Util.snip (prefix <> text))
+            pretty (Dhall.Util.snip numberedLines)
         <>  "\n"
         <>  pretty (Text.Megaparsec.sourcePosPretty begin)
       where
         prefix = Data.Text.replicate (n - 1) " "
           where
             n = Text.Megaparsec.unPos (Text.Megaparsec.sourceColumn begin)
+
+        ls = Data.Text.lines (prefix <> text)
+
+        numberOfLines = length ls
+
+        minimumNumber =
+            Text.Megaparsec.unPos (Text.Megaparsec.sourceLine begin)
+
+        maximumNumber = minimumNumber + numberOfLines - 1
+
+        numberWidth :: Int
+        numberWidth =
+            truncate (logBase (10 :: Double) (fromIntegral maximumNumber)) + 1
+
+        adapt n line = Data.Text.pack outputString
+          where
+            inputString = Data.Text.unpack line
+
+            outputString =
+                Text.Printf.printf ("%" <> show numberWidth <> "d: %s") n inputString
+
+        numberedLines = Data.Text.unlines (zipWith adapt [minimumNumber..] ls)
 
 {-| A `Parser` that is almost identical to
     @"Text.Megaparsec".`Text.Megaparsec.Parsec`@ except treating Haskell-style
@@ -193,7 +236,11 @@ instance Text.Parser.Char.CharParsing Parser where
 
   notChar = Text.Megaparsec.Char.char
 
+#if MIN_VERSION_megaparsec(7, 0, 0)
   anyChar = Text.Megaparsec.anySingle
+#else
+  anyChar = Text.Megaparsec.Char.anyChar
+#endif
 
   string = fmap Data.Text.unpack . Text.Megaparsec.Char.string . fromString
 

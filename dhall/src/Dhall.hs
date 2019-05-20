@@ -4,12 +4,14 @@
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiWayIf                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE StandaloneDeriving         #-}
 {-# LANGUAGE TypeOperators              #-}
+{-# LANGUAGE TupleSections              #-}
 
 {-| Please read the "Dhall.Tutorial" module, which contains a tutorial explaining
     how to use the language, the compiler, and this library
@@ -39,6 +41,7 @@ module Dhall
     -- * Types
     , Type(..)
     , RecordType(..)
+    , UnionType(..)
     , InputType(..)
     , Interpret(..)
     , InvalidType(..)
@@ -62,15 +65,23 @@ module Dhall
     , pair
     , record
     , field
+    , union
+    , constructor
     , GenericInterpret(..)
     , GenericInject(..)
 
     , Inject(..)
     , inject
+    , genericInject
     , RecordInputType(..)
     , inputFieldWith
     , inputField
     , inputRecord
+    , UnionInputType(..)
+    , inputConstructorWith
+    , inputConstructor
+    , inputUnion
+    , (>|<)
 
     -- * Miscellaneous
     , rawInput
@@ -88,12 +99,15 @@ module Dhall
 import Control.Applicative (empty, liftA2, (<|>), Alternative)
 import Control.Exception (Exception)
 import Control.Monad.Trans.State.Strict
-import Data.Functor.Contravariant (Contravariant(..), (>$<))
+import Control.Monad (guard)
+import Data.Coerce (coerce)
+import Data.Functor.Contravariant (Contravariant(..), (>$<), Op(..))
 import Data.Functor.Contravariant.Divisible (Divisible(..), divided)
 import Data.Monoid ((<>))
 import Data.Scientific (Scientific)
 import Data.Sequence (Seq)
 import Data.Text (Text)
+import Data.Text.Prettyprint.Doc (Pretty)
 import Data.Typeable (Typeable)
 import Data.Vector (Vector)
 import Data.Word (Word8, Word16, Word32, Word64)
@@ -114,6 +128,7 @@ import qualified Control.Monad.Trans.State.Strict as State
 import qualified Data.Foldable
 import qualified Data.Functor.Compose
 import qualified Data.Functor.Product
+import qualified Data.Semigroup
 import qualified Data.Scientific
 import qualified Data.Sequence
 import qualified Data.Set
@@ -129,13 +144,11 @@ import qualified Dhall.Map
 import qualified Dhall.Parser
 import qualified Dhall.Pretty.Internal
 import qualified Dhall.TypeCheck
+import qualified Dhall.Util
 
 -- $setup
 -- >>> :set -XOverloadedStrings
-
-throws :: Exception e => Either e a -> IO a
-throws (Left  e) = Control.Exception.throwIO e
-throws (Right r) = return r
+-- >>> :set -XRecordWildCards
 
 {-| Every `Type` must obey the contract that if an expression's type matches the
     the `expected` type then the `extract` function must succeed.  If not, then
@@ -144,19 +157,36 @@ throws (Right r) = return r
     This exception indicates that an invalid `Type` was provided to the `input`
     function
 -}
-data InvalidType = InvalidType deriving (Typeable)
+data InvalidType s a = InvalidType
+  { invalidTypeExpected :: Expr s a
+  , invalidTypeExpression :: Expr s a
+  }
+  deriving (Typeable)
 
 _ERROR :: String
 _ERROR = "\ESC[1;31mError\ESC[0m"
 
-instance Show InvalidType where
-    show InvalidType =
+instance (Pretty s, Pretty a, Typeable s, Typeable a) => Show (InvalidType s a) where
+    show InvalidType { .. } =
         _ERROR <> ": Invalid Dhall.Type                                                  \n\
         \                                                                                \n\
         \Every Type must provide an extract function that succeeds if an expression      \n\
-        \matches the expected type.  You provided a Type that disobeys this contract     \n"
+        \matches the expected type.  You provided a Type that disobeys this contract     \n\
+        \                                                                                \n\
+        \The Type provided has the expected dhall type:                                  \n\
+        \                                                                                \n\
+        \" <> show txt0 <> "\n\
+        \                                                                                \n\
+        \and it couldn't extract a value from the well-typed expression:                 \n\
+        \                                                                                \n\
+        \" <> show txt1 <> "\n\
+        \                                                                                \n"
+        where
+          txt0 = Dhall.Util.insert invalidTypeExpected
+          txt1 = Dhall.Util.insert invalidTypeExpression
 
-instance Exception InvalidType
+
+instance (Pretty s, Pretty a, Typeable s, Typeable a) => Exception (InvalidType s a)
 
 -- | @since 1.16
 data InputSettings = InputSettings
@@ -200,7 +230,7 @@ sourceName k s =
 -- | @since 1.16
 data EvaluateSettings = EvaluateSettings
   { _startingContext :: Dhall.Context.Context (Expr Src X)
-  , _normalizer      :: Dhall.Core.ReifiedNormalizer X
+  , _normalizer      :: Maybe (Dhall.Core.ReifiedNormalizer X)
   , _standardVersion :: StandardVersion
   }
 
@@ -211,7 +241,7 @@ data EvaluateSettings = EvaluateSettings
 defaultEvaluateSettings :: EvaluateSettings
 defaultEvaluateSettings = EvaluateSettings
   { _startingContext = Dhall.Context.empty
-  , _normalizer      = Dhall.Core.ReifiedNormalizer (const (pure Nothing))
+  , _normalizer      = Nothing
   , _standardVersion = Dhall.Binary.defaultStandardVersion
   }
 
@@ -232,11 +262,11 @@ startingContext = evaluateSettings . l
 -- @since 1.16
 normalizer
   :: (Functor f, HasEvaluateSettings s)
-  => LensLike' f s (Dhall.Core.ReifiedNormalizer X)
+  => LensLike' f s (Maybe (Dhall.Core.ReifiedNormalizer X))
 normalizer = evaluateSettings . l
   where
     l :: (Functor f)
-      => LensLike' f EvaluateSettings (Dhall.Core.ReifiedNormalizer X)
+      => LensLike' f EvaluateSettings (Maybe (Dhall.Core.ReifiedNormalizer X))
     l k s = fmap (\x -> s { _normalizer = x }) (k (_normalizer s))
 
 -- | Access the standard version (used primarily when encoding or decoding
@@ -305,7 +335,7 @@ inputWithSettings
     -> IO a
     -- ^ The decoded value in Haskell
 inputWithSettings settings (Type {..}) txt = do
-    expr  <- throws (Dhall.Parser.exprFromText (view sourceName settings) txt)
+    expr  <- Dhall.Core.throws (Dhall.Parser.exprFromText (view sourceName settings) txt)
 
     let InputSettings {..} = settings
 
@@ -328,10 +358,13 @@ inputWithSettings settings (Type {..}) txt = do
                 bytes' = bytes <> " : " <> suffix
             _ ->
                 Annot expr' expected
-    _ <- throws (Dhall.TypeCheck.typeWith (view startingContext settings) annot)
-    case extract (Dhall.Core.normalizeWith (Dhall.Core.getReifiedNormalizer (view normalizer settings)) expr') of
+    _ <- Dhall.Core.throws (Dhall.TypeCheck.typeWith (view startingContext settings) annot)
+    let normExpr = Dhall.Core.normalizeWith (view normalizer settings) expr'
+
+    case extract normExpr  of
         Just x  -> return x
-        Nothing -> Control.Exception.throwIO InvalidType
+        Nothing -> Control.Exception.throwIO
+                     (InvalidType expected expr')
 
 {-| Type-check and evaluate a Dhall program that is read from the
     file-system.
@@ -398,7 +431,7 @@ inputExprWithSettings
     -> IO (Expr Src X)
     -- ^ The fully normalized AST
 inputExprWithSettings settings txt = do
-    expr  <- throws (Dhall.Parser.exprFromText (view sourceName settings) txt)
+    expr  <- Dhall.Core.throws (Dhall.Parser.exprFromText (view sourceName settings) txt)
 
     let InputSettings {..} = settings
 
@@ -413,8 +446,8 @@ inputExprWithSettings settings txt = do
 
     expr' <- State.evalStateT (Dhall.Import.loadWith expr) status
 
-    _ <- throws (Dhall.TypeCheck.typeWith (view startingContext settings) expr')
-    pure (Dhall.Core.normalizeWith (Dhall.Core.getReifiedNormalizer (view normalizer settings)) expr')
+    _ <- Dhall.Core.throws (Dhall.TypeCheck.typeWith (view startingContext settings) expr')
+    pure (Dhall.Core.normalizeWith (view normalizer settings) expr')
 
 -- | Use this function to extract Haskell values directly from Dhall AST.
 --   The intended use case is to allow easy extraction of Dhall values for
@@ -671,7 +704,7 @@ maybe (Type extractIn expectedIn) = Type extractOut expectedOut
     expectedOut = App Optional expectedIn
 
 {-| Decode a `Seq`
- -
+
 >>> input (sequence natural) "[1, 2, 3]"
 fromList [1,2,3]
 -}
@@ -798,7 +831,9 @@ instance Interpret a => Interpret (Vector a) where
 instance (Inject a, Interpret b) => Interpret (a -> b) where
     autoWith opts = Type extractOut expectedOut
       where
-        extractOut e = Just (\i -> case extractIn (Dhall.Core.normalize (App e (embed i))) of
+        normalizer_ = Just (inputNormalizer opts)
+
+        extractOut e = Just (\i -> case extractIn (Dhall.Core.normalizeWith normalizer_ (App e (embed i))) of
             Just o  -> o
             Nothing -> error "Interpret: You cannot decode a function if it does not have the correct type" )
 
@@ -835,6 +870,10 @@ data InterpretOptions = InterpretOptions
     , constructorModifier :: Text -> Text
     -- ^ Function used to transform Haskell constructor names into their
     --   corresponding Dhall alternative names
+    , inputNormalizer     :: Dhall.Core.ReifiedNormalizer X
+    -- ^ This is only used by the `Interpret` instance for functions in order
+    --   to normalize the function input before marshaling the input into a
+    --   Dhall expression
     }
 
 {-| Default interpret options, which you can tweak or override, like this:
@@ -846,6 +885,7 @@ defaultInterpretOptions :: InterpretOptions
 defaultInterpretOptions = InterpretOptions
     { fieldModifier       = id
     , constructorModifier = id
+    , inputNormalizer     = Dhall.Core.ReifiedNormalizer (const (pure Nothing))
     }
 
 {-| This is the underlying class that powers the `Interpret` class's support
@@ -866,6 +906,60 @@ instance GenericInterpret V1 where
 
         expected = Union mempty
 
+unsafeExpectUnion
+    :: Text -> Expr Src X -> Dhall.Map.Map Text (Maybe (Expr Src X))
+unsafeExpectUnion _ (Union kts) =
+    kts
+unsafeExpectUnion name expression =
+    Dhall.Core.internalError
+        (name <> ": Unexpected constructor: " <> Dhall.Core.pretty expression)
+
+unsafeExpectRecord :: Text -> Expr Src X -> Dhall.Map.Map Text (Expr Src X)
+unsafeExpectRecord _ (Record kts) =
+    kts
+unsafeExpectRecord name expression =
+    Dhall.Core.internalError
+        (name <> ": Unexpected constructor: " <> Dhall.Core.pretty expression)
+
+unsafeExpectUnionLit
+    :: Text
+    -> Expr Src X
+    -> (Text, Maybe (Expr Src X))
+unsafeExpectUnionLit _ (Field (Union _) k) =
+    (k, Nothing)
+unsafeExpectUnionLit _ (App (Field (Union _) k) v) =
+    (k, Just v)
+unsafeExpectUnionLit name expression =
+    Dhall.Core.internalError
+        (name <> ": Unexpected constructor: " <> Dhall.Core.pretty expression)
+
+unsafeExpectRecordLit :: Text -> Expr Src X -> Dhall.Map.Map Text (Expr Src X)
+unsafeExpectRecordLit _ (RecordLit kvs) =
+    kvs
+unsafeExpectRecordLit name expression =
+    Dhall.Core.internalError
+        (name <> ": Unexpected constructor: " <> Dhall.Core.pretty expression)
+
+notEmptyRecordLit :: Expr s a -> Maybe (Expr s a)
+notEmptyRecordLit e = case e of
+    RecordLit m | null m -> Nothing
+    _                    -> Just e
+
+notEmptyRecord :: Expr s a -> Maybe (Expr s a)
+notEmptyRecord e = case e of
+    Record m | null m -> Nothing
+    _                 -> Just e
+extractUnionConstructor
+    :: Expr s a -> Maybe (Text, Expr s a, Dhall.Map.Map Text (Maybe (Expr s a)))
+extractUnionConstructor (UnionLit fld e rest) =
+  return (fld, e, rest)
+extractUnionConstructor (App (Field (Union kts) fld) e) =
+  return (fld, e, Dhall.Map.delete fld kts)
+extractUnionConstructor (Field (Union kts) fld) =
+  return (fld, RecordLit mempty, Dhall.Map.delete fld kts)
+extractUnionConstructor _ =
+  empty
+
 instance (Constructor c1, Constructor c2, GenericInterpret f1, GenericInterpret f2) => GenericInterpret (M1 C c1 f1 :+: M1 C c2 f2) where
     genericAutoWith options@(InterpretOptions {..}) = pure (Type {..})
       where
@@ -878,14 +972,20 @@ instance (Constructor c1, Constructor c2, GenericInterpret f1, GenericInterpret 
         nameL = constructorModifier (Data.Text.pack (conName nL))
         nameR = constructorModifier (Data.Text.pack (conName nR))
 
-        extract (UnionLit name e _)
-            | name == nameL = fmap (L1 . M1) (extractL e)
-            | name == nameR = fmap (R1 . M1) (extractR e)
-            | otherwise     = Nothing
-        extract _ = Nothing
+        extract e0 = do
+          (name, e1, _) <- extractUnionConstructor e0
+          if
+            | name == nameL -> fmap (L1 . M1) (extractL e1)
+            | name == nameR -> fmap (R1 . M1) (extractR e1)
+            | otherwise     -> Nothing
 
         expected =
-            Union (Dhall.Map.fromList [(nameL, expectedL), (nameR, expectedR)])
+            Union
+                (Dhall.Map.fromList
+                    [ (nameL, notEmptyRecord expectedL)
+                    , (nameR, notEmptyRecord expectedR)
+                    ]
+                )
 
         Type extractL expectedL = evalState (genericAutoWith options) 1
         Type extractR expectedR = evalState (genericAutoWith options) 1
@@ -898,16 +998,19 @@ instance (Constructor c, GenericInterpret (f :+: g), GenericInterpret h) => Gene
 
         name = constructorModifier (Data.Text.pack (conName n))
 
-        extract u@(UnionLit name' e _)
-            | name == name' = fmap (R1 . M1) (extractR e)
-            | otherwise     = fmap  L1       (extractL u)
-        extract _ = Nothing
+        extract u = do
+          (name', e, _) <- extractUnionConstructor u
+          if
+            | name == name' -> fmap (R1 . M1) (extractR e)
+            | otherwise     -> fmap  L1       (extractL u)
 
         expected =
-            Union (Dhall.Map.insert name expectedR expectedL)
+            Union (Dhall.Map.insert name (notEmptyRecord expectedR) ktsL)
 
-        Type extractL (Union expectedL) = evalState (genericAutoWith options) 1
-        Type extractR        expectedR  = evalState (genericAutoWith options) 1
+        Type extractL expectedL = evalState (genericAutoWith options) 1
+        Type extractR expectedR = evalState (genericAutoWith options) 1
+
+        ktsL = unsafeExpectUnion "genericAutoWith (:+:)" expectedL
 
 instance (Constructor c, GenericInterpret f, GenericInterpret (g :+: h)) => GenericInterpret (M1 C c f :+: (g :+: h)) where
     genericAutoWith options@(InterpretOptions {..}) = pure (Type {..})
@@ -917,26 +1020,32 @@ instance (Constructor c, GenericInterpret f, GenericInterpret (g :+: h)) => Gene
 
         name = constructorModifier (Data.Text.pack (conName n))
 
-        extract u@(UnionLit name' e _)
-            | name == name' = fmap (L1 . M1) (extractL e)
-            | otherwise     = fmap  R1       (extractR u)
-        extract _ = Nothing
+        extract u = do
+          (name', e, _) <- extractUnionConstructor u
+          if
+            | name == name' -> fmap (L1 . M1) (extractL e)
+            | otherwise     -> fmap  R1       (extractR u)
 
         expected =
-            Union (Dhall.Map.insert name expectedL expectedR)
+            Union (Dhall.Map.insert name (notEmptyRecord expectedL) ktsR)
 
-        Type extractL        expectedL  = evalState (genericAutoWith options) 1
-        Type extractR (Union expectedR) = evalState (genericAutoWith options) 1
+        Type extractL expectedL = evalState (genericAutoWith options) 1
+        Type extractR expectedR = evalState (genericAutoWith options) 1
+
+        ktsR = unsafeExpectUnion "genericAutoWith (:+:)" expectedR
 
 instance (GenericInterpret (f :+: g), GenericInterpret (h :+: i)) => GenericInterpret ((f :+: g) :+: (h :+: i)) where
     genericAutoWith options = pure (Type {..})
       where
         extract e = fmap L1 (extractL e) <|> fmap R1 (extractR e)
 
-        expected = Union (Dhall.Map.union expectedL expectedR)
+        expected = Union (Dhall.Map.union ktsL ktsR)
 
-        Type extractL (Union expectedL) = evalState (genericAutoWith options) 1
-        Type extractR (Union expectedR) = evalState (genericAutoWith options) 1
+        Type extractL expectedL = evalState (genericAutoWith options) 1
+        Type extractR expectedR = evalState (genericAutoWith options) 1
+
+        ktsL = unsafeExpectUnion "genericAutoWith (:+:)" expectedL
+        ktsR = unsafeExpectUnion "genericAutoWith (:+:)" expectedR
 
 instance GenericInterpret f => GenericInterpret (M1 C c f) where
     genericAutoWith options = do
@@ -954,8 +1063,8 @@ instance (GenericInterpret f, GenericInterpret g) => GenericInterpret (f :*: g) 
     genericAutoWith options = do
         Type extractL expectedL <- genericAutoWith options
         Type extractR expectedR <- genericAutoWith options
-        let Record ktsL = expectedL
-        let Record ktsR = expectedR
+        let ktsL = unsafeExpectRecord "genericAutoWith (:*:)"expectedL
+        let ktsR = unsafeExpectRecord "genericAutoWith (:*:)"expectedR
         pure
             (Type
                 { extract = liftA2 (liftA2 (:*:)) extractL extractR
@@ -1031,6 +1140,17 @@ class Inject a where
 -}
 inject :: Inject a => InputType a
 inject = injectWith defaultInterpretOptions
+
+{-| Use the default options for injecting a value, whose structure is
+determined generically.
+
+This can be used when you want to use 'Inject' on types that you don't
+want to define orphan instances for.
+-}
+genericInject
+  :: (Generic a, GenericInject (Rep a)) => InputType a
+genericInject
+    = contramap GHC.Generics.from (evalState (genericInjectWith defaultInterpretOptions) 1)
 
 instance Inject Bool where
     injectWith _ = InputType {..}
@@ -1169,13 +1289,26 @@ instance (Constructor c1, Constructor c2, GenericInject f1, GenericInject f2) =>
     genericInjectWith options@(InterpretOptions {..}) = pure (InputType {..})
       where
         embed (L1 (M1 l)) =
-            UnionLit keyL (embedL l) (Dhall.Map.singleton keyR declaredR)
+            case notEmptyRecordLit (embedL l) of
+                Nothing ->
+                    Field declared keyL
+                Just valL ->
+                    App (Field declared keyL) valL
 
         embed (R1 (M1 r)) =
-            UnionLit keyR (embedR r) (Dhall.Map.singleton keyL declaredL)
+            case notEmptyRecordLit (embedR r) of
+                Nothing ->
+                    Field declared keyR
+                Just valR ->
+                    App (Field declared keyR) valR
 
         declared =
-            Union (Dhall.Map.fromList [(keyL, declaredL), (keyR, declaredR)])
+            Union
+                (Dhall.Map.fromList
+                    [ (keyL, notEmptyRecord declaredL)
+                    , (keyR, notEmptyRecord declaredR)
+                    ]
+                )
 
         nL :: M1 i c1 f1 a
         nL = undefined
@@ -1193,56 +1326,81 @@ instance (Constructor c, GenericInject (f :+: g), GenericInject h) => GenericInj
     genericInjectWith options@(InterpretOptions {..}) = pure (InputType {..})
       where
         embed (L1 l) =
-            UnionLit keyL valL (Dhall.Map.insert keyR declaredR ktsL')
+            case maybeValL of
+                Nothing   -> Field declared keyL
+                Just valL -> App (Field declared keyL) valL
           where
-            UnionLit keyL valL ktsL' = embedL l
-        embed (R1 (M1 r)) = UnionLit keyR (embedR r) ktsL
+            (keyL, maybeValL) =
+              unsafeExpectUnionLit "genericInjectWith (:+:)" (embedL l)
+        embed (R1 (M1 r)) =
+            case notEmptyRecordLit (embedR r) of
+                Nothing   -> Field declared keyR
+                Just valR -> App (Field declared keyR) valR
 
         nR :: M1 i c h a
         nR = undefined
 
         keyR = constructorModifier (Data.Text.pack (conName nR))
 
-        declared = Union (Dhall.Map.insert keyR declaredR ktsL)
+        declared = Union (Dhall.Map.insert keyR (notEmptyRecord declaredR) ktsL)
 
-        InputType embedL (Union ktsL) = evalState (genericInjectWith options) 1
-        InputType embedR  declaredR   = evalState (genericInjectWith options) 1
+        InputType embedL declaredL = evalState (genericInjectWith options) 1
+        InputType embedR declaredR = evalState (genericInjectWith options) 1
+
+        ktsL = unsafeExpectUnion "genericInjectWith (:+:)" declaredL
 
 instance (Constructor c, GenericInject f, GenericInject (g :+: h)) => GenericInject (M1 C c f :+: (g :+: h)) where
     genericInjectWith options@(InterpretOptions {..}) = pure (InputType {..})
       where
-        embed (L1 (M1 l)) = UnionLit keyL (embedL l) ktsR
+        embed (L1 (M1 l)) =
+            case notEmptyRecordLit (embedL l) of
+                Nothing   -> Field declared keyL
+                Just valL -> App (Field declared keyL) valL
         embed (R1 r) =
-            UnionLit keyR valR (Dhall.Map.insert keyL declaredL ktsR')
+            case maybeValR of
+                Nothing   -> Field declared keyR
+                Just valR -> App (Field declared keyR) valR
           where
-            UnionLit keyR valR ktsR' = embedR r
+            (keyR, maybeValR) =
+                unsafeExpectUnionLit "genericInjectWith (:+:)" (embedR r)
 
         nL :: M1 i c f a
         nL = undefined
 
         keyL = constructorModifier (Data.Text.pack (conName nL))
 
-        declared = Union (Dhall.Map.insert keyL declaredL ktsR)
+        declared = Union (Dhall.Map.insert keyL (notEmptyRecord declaredL) ktsR)
 
-        InputType embedL  declaredL   = evalState (genericInjectWith options) 1
-        InputType embedR (Union ktsR) = evalState (genericInjectWith options) 1
+        InputType embedL declaredL = evalState (genericInjectWith options) 1
+        InputType embedR declaredR = evalState (genericInjectWith options) 1
+
+        ktsR = unsafeExpectUnion "genericInjectWith (:+:)" declaredR
 
 instance (GenericInject (f :+: g), GenericInject (h :+: i)) => GenericInject ((f :+: g) :+: (h :+: i)) where
     genericInjectWith options = pure (InputType {..})
       where
         embed (L1 l) =
-            UnionLit keyL valR (Dhall.Map.union ktsL' ktsR)
+            case maybeValL of
+                Nothing   -> Field declared keyL
+                Just valL -> App (Field declared keyL) valL
           where
-            UnionLit keyL valR ktsL' = embedL l
+            (keyL, maybeValL) =
+                unsafeExpectUnionLit "genericInjectWith (:+:)" (embedL l)
         embed (R1 r) =
-            UnionLit keyR valR (Dhall.Map.union ktsL ktsR')
+            case maybeValR of
+                Nothing   -> Field declared keyR
+                Just valR -> App (Field declared keyR) valR
           where
-            UnionLit keyR valR ktsR' = embedR r
+            (keyR, maybeValR) =
+                unsafeExpectUnionLit "genericInjectWith (:+:)" (embedR r)
 
         declared = Union (Dhall.Map.union ktsL ktsR)
 
-        InputType embedL (Union ktsL) = evalState (genericInjectWith options) 1
-        InputType embedR (Union ktsR) = evalState (genericInjectWith options) 1
+        InputType embedL declaredL = evalState (genericInjectWith options) 1
+        InputType embedR declaredR = evalState (genericInjectWith options) 1
+
+        ktsL = unsafeExpectUnion "genericInjectWith (:+:)" declaredL
+        ktsR = unsafeExpectUnion "genericInjectWith (:+:)" declaredR
 
 instance (GenericInject f, GenericInject g) => GenericInject (f :*: g) where
     genericInjectWith options = do
@@ -1252,13 +1410,16 @@ instance (GenericInject f, GenericInject g) => GenericInject (f :*: g) where
         let embed (l :*: r) =
                 RecordLit (Dhall.Map.union mapL mapR)
               where
-                RecordLit mapL = embedInL l
-                RecordLit mapR = embedInR r
+                mapL =
+                    unsafeExpectRecordLit "genericInjectWith (:*:)" (embedInL l)
+
+                mapR =
+                    unsafeExpectRecordLit "genericInjectWith (:*:)" (embedInR r)
 
         let declared = Record (Dhall.Map.union mapL mapR)
               where
-                Record mapL = declaredInL
-                Record mapR = declaredInR
+                mapL = unsafeExpectRecord "genericInjectWith (:*:)" declaredInL
+                mapR = unsafeExpectRecord "genericInjectWith (:*:)" declaredInR
 
         pure (InputType {..})
 
@@ -1288,11 +1449,13 @@ instance (Selector s, Inject a) => GenericInject (M1 S s (K1 i a)) where
 
     For example, let's take the following Haskell data type:
 
-> data Project = Project
->   { projectName :: Text
->   , projectDescription :: Text
->   , projectStars :: Natural
->   }
+>>> :{
+data Project = Project
+  { projectName :: Text
+  , projectDescription :: Text
+  , projectStars :: Natural
+  }
+:}
 
     And assume that we have the following Dhall record that we would like to
     parse as a @Project@:
@@ -1309,14 +1472,15 @@ instance (Selector s, Inject a) => GenericInject (M1 S s (K1 i a)) where
     smaller parsers, as 'Type's cannot be combined (they are only 'Functor's).
     However, we can use a 'RecordType' to build a 'Type' for @Project@:
 
-> project :: Type Project
-> project =
->   record
->     ( Project <$> field "name" string
->               <*> field "description" string
->               <*> field "stars" natural
->     )
-
+>>> :{
+project :: Type Project
+project =
+  record
+    ( Project <$> field "name" strictText
+              <*> field "description" strictText
+              <*> field "stars" natural
+    )
+:}
 -}
 
 newtype RecordType a =
@@ -1371,16 +1535,87 @@ field key valueType =
           ( Data.Functor.Compose.Compose extractBody )
       )
 
+{-| The 'UnionType' monoid allows you to build a 'Type' parser
+    from a Dhall union
+
+    For example, let's take the following Haskell data type:
+
+>>> :{
+data Status = Queued Natural
+            | Result Text
+            | Errored Text
+:}
+
+    And assume that we have the following Dhall union that we would like to
+    parse as a @Status@:
+
+> < Result = "Finish succesfully"
+> | Queued : Natural
+> | Errored : Text
+> >
+
+    Our parser has type 'Type' @Status@, but we can't build that out of any
+    smaller parsers, as 'Type's cannot be combined (they are only 'Functor's).
+    However, we can use a 'UnionType' to build a 'Type' for @Status@:
+
+>>> :{
+status :: Type Status
+status = union
+  (  ( Queued  <$> constructor "Queued"  natural )
+  <> ( Result  <$> constructor "Result"  strictText )
+  <> ( Errored <$> constructor "Errored" strictText )
+  )
+:}
+
+-}
+newtype UnionType a =
+    UnionType
+      ( Data.Functor.Compose.Compose (Dhall.Map.Map Text) Type a )
+  deriving (Functor)
+
+instance Data.Semigroup.Semigroup (UnionType a) where
+    (<>) = coerce ((<>) :: Dhall.Map.Map Text (Type a) -> Dhall.Map.Map Text (Type a) -> Dhall.Map.Map Text (Type a))
+
+instance Monoid (UnionType a) where
+    mempty = coerce (mempty :: Dhall.Map.Map Text (Type a))
+    mappend = (Data.Semigroup.<>)
+
+-- | Run a 'UnionType' parser to build a 'Type' parser.
+union :: UnionType a -> Type a
+union (UnionType (Data.Functor.Compose.Compose mp)) = Type
+    { extract  = extractF
+    , expected = Union expect
+    }
+  where
+    expect = (notEmptyRecord . Dhall.expected) <$> mp
+
+    extractF e0 = do
+      (fld, e1, rest) <- extractUnionConstructor e0
+
+      t <- Dhall.Map.lookup fld mp
+
+      guard $ Dhall.Core.Union rest `Dhall.Core.judgmentallyEqual`
+                Dhall.Core.Union (Dhall.Map.delete fld expect)
+
+      extract t e1
+
+-- | Parse a single constructor of a union
+constructor :: Text -> Type a -> UnionType a
+constructor key valueType = UnionType
+    ( Data.Functor.Compose.Compose (Dhall.Map.singleton key valueType) )
+
 {-| The 'RecordInputType' divisible (contravariant) functor allows you to build
     an 'InputType' injector for a Dhall record.
 
     For example, let's take the following Haskell data type:
 
-> data Project = Project
->   { projectName :: Text
->   , projectDescription :: Text
->   , projectStars :: Natural
->   }
+>>> :{
+data Project = Project
+  { projectName :: Text
+  , projectDescription :: Text
+  , projectStars :: Natural
+  }
+:}
 
     And assume that we have the following Dhall record that we would like to
     parse as a @Project@:
@@ -1397,27 +1632,31 @@ field key valueType =
     smaller injectors, as 'InputType's cannot be combined (they are only 'Contravariant's).
     However, we can use an 'InputRecordType' to build an 'InputType' for @Project@:
 
-> injectProject :: InputType Project
-> injectProject =
->   inputRecord
->     (  adapt >$< inputFieldWith "name" inject
->              >*< inputFieldWith "description" inject
->              >*< inputFieldWith "stars" inject
->     )
->   where
->     adapt (Project{..}) = (projectName, (projectDescription, projectStars))
+>>> :{
+injectProject :: InputType Project
+injectProject =
+  inputRecord
+    ( adapt >$< inputFieldWith "name" inject
+            >*< inputFieldWith "description" inject
+            >*< inputFieldWith "stars" inject
+    )
+  where
+    adapt (Project{..}) = (projectName, (projectDescription, projectStars))
+:}
 
     Or, since we are simply using the `Inject` instance to inject each field, we could write
 
-> injectProject :: InputType Project
-> injectProject =
->   inputRecord
->     (  adapt >$< inputField "name"
->              >*< inputField "description"
->              >*< inputField "stars"
->     )
->   where
->     adapt (Project{..}) = (projectName, (projectDescription, projectStars))
+>>> :{
+injectProject :: InputType Project
+injectProject =
+  inputRecord
+    ( adapt >$< inputField "name"
+            >*< inputField "description"
+            >*< inputField "stars"
+    )
+  where
+    adapt (Project{..}) = (projectName, (projectDescription, projectStars))
+:}
 
 -}
 
@@ -1453,4 +1692,120 @@ inputRecord (RecordInputType inputTypeRecord) = InputType makeRecordLit recordTy
     recordType = Record $ declared <$> inputTypeRecord
     makeRecordLit x = RecordLit $ (($ x) . embed) <$> inputTypeRecord
 
+{-| The 'UnionInputType' monoid allows you to build
+    an 'InputType' injector for a Dhall record.
 
+    For example, let's take the following Haskell data type:
+
+>>> :{
+data Status = Queued Natural
+            | Result Text
+            | Errored Text
+:}
+
+    And assume that we have the following Dhall union that we would like to
+    parse as a @Status@:
+
+> < Result = "Finish succesfully"
+> | Queued : Natural
+> | Errored : Text
+> >
+
+    Our injector has type 'InputType' @Status@, but we can't build that out of any
+    smaller injectors, as 'InputType's cannot be combined.
+    However, we can use an 'UnionInputType' to build an 'InputType' for @Status@:
+
+>>> :{
+injectStatus :: InputType Status
+injectStatus = adapt >$< inputUnion
+  (   inputConstructorWith "Queued"  inject
+  >|< inputConstructorWith "Result"  inject
+  >|< inputConstructorWith "Errored" inject
+  )
+  where
+    adapt (Queued  n) = Left n
+    adapt (Result  t) = Right (Left t)
+    adapt (Errored e) = Right (Right e)
+:}
+
+    Or, since we are simply using the `Inject` instance to inject each branch, we could write
+
+>>> :{
+injectStatus :: InputType Status
+injectStatus = adapt >$< inputUnion
+  (   inputConstructor "Queued"
+  >|< inputConstructor "Result"
+  >|< inputConstructor "Errored"
+  )
+  where
+    adapt (Queued  n) = Left n
+    adapt (Result  t) = Right (Left t)
+    adapt (Errored e) = Right (Right e)
+:}
+
+-}
+newtype UnionInputType a =
+  UnionInputType
+    ( Data.Functor.Product.Product
+        ( Control.Applicative.Const
+            ( Dhall.Map.Map
+                Text
+                ( Expr Src X )
+            )
+        )
+        ( Op (Text, Expr Src X) )
+        a
+    )
+  deriving (Contravariant)
+
+-- | Combines two 'UnionInputType' values.  See 'UnionInputType' for usage
+-- notes.
+--
+-- Ideally, this matches 'Data.Functor.Contravariant.Divisible.chosen';
+-- however, this allows 'UnionInputType' to not need a 'Divisible' instance
+-- itself (since no instance is possible).
+(>|<) :: UnionInputType a -> UnionInputType b -> UnionInputType (Either a b)
+UnionInputType (Data.Functor.Product.Pair (Control.Applicative.Const mx) (Op fx))
+    >|< UnionInputType (Data.Functor.Product.Pair (Control.Applicative.Const my) (Op fy)) =
+    UnionInputType
+      ( Data.Functor.Product.Pair
+          ( Control.Applicative.Const (mx <> my) )
+          ( Op (either fx fy) )
+      )
+
+infixr 5 >|<
+
+inputUnion :: UnionInputType a -> InputType a
+inputUnion ( UnionInputType ( Data.Functor.Product.Pair ( Control.Applicative.Const fields ) ( Op embedF ) ) ) =
+    InputType
+      { embed = \x ->
+          let (name, y) = embedF x
+          in  case notEmptyRecordLit y of
+                  Nothing  -> Field (Union fields') name
+                  Just val -> App (Field (Union fields') name) val
+      , declared =
+          Union fields'
+      }
+  where
+    fields' = fmap notEmptyRecord fields
+
+inputConstructorWith
+    :: Text
+    -> InputType a
+    -> UnionInputType a
+inputConstructorWith name inputType = UnionInputType $
+    Data.Functor.Product.Pair
+      ( Control.Applicative.Const
+          ( Dhall.Map.singleton
+              name
+              ( declared inputType )
+          )
+      )
+      ( Op ( (name,) . embed inputType )
+      )
+
+inputConstructor
+    :: Inject a
+    => Text
+    -> UnionInputType a
+inputConstructor name = inputConstructorWith name inject
