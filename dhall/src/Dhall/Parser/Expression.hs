@@ -15,14 +15,17 @@ import Data.List.NonEmpty (NonEmpty(..))
 import Data.Semigroup (Semigroup(..))
 import Data.Text (Text)
 import Dhall.Core
+import Dhall.Src (Src(..))
 import Prelude hiding (const, pi)
 import Text.Parser.Combinators (choice, try, (<?>))
 
+import qualified Control.Monad
 import qualified Crypto.Hash
 import qualified Data.ByteArray.Encoding
 import qualified Data.ByteString
 import qualified Data.Char
 import qualified Data.Foldable
+import qualified Data.List
 import qualified Data.List.NonEmpty
 import qualified Data.Sequence
 import qualified Data.Text
@@ -166,13 +169,9 @@ completeExpression embedded = completeExpression_
                     case (shallowDenote a, shallowDenote b) of
                         (ListLit _ xs, App f c) ->
                             case shallowDenote f of
-                                List     -> case xs of
+                                List -> case xs of
                                     [] -> return (ListLit (Just c) xs)
                                     _  -> return (Annot a b)
-                                Optional -> case xs of
-                                    [x] -> return (OptionalLit c (Just x))
-                                    []  -> return (OptionalLit c Nothing)
-                                    _   -> return (Annot a b)
                                 _ ->
                                     return (Annot a b)
                         (Merge c d _, e) ->
@@ -247,9 +246,18 @@ completeExpression embedded = completeExpression_
     selectorExpression = noted (do
             a <- primitiveExpression
 
-            let left  x  e = Field   e x
-            let right xs e = Project e xs
-            b <- Text.Megaparsec.many (try (do _dot; fmap left anyLabel <|> fmap right labels))
+            let recordType = _openParens *> expression <* _closeParens
+
+            let field               x  e = Field   e  x
+            let projectBySet        xs e = Project e (Left  xs)
+            let projectByExpression xs e = Project e (Right xs)
+
+            let alternatives =
+                        fmap field               anyLabel
+                    <|> fmap projectBySet        labels
+                    <|> fmap projectByExpression recordType
+
+            b <- Text.Megaparsec.many (try (do _dot; alternatives))
             return (foldl (\e k -> k e) a b) )
 
     primitiveExpression =
@@ -306,7 +314,7 @@ completeExpression embedded = completeExpression_
             alternative07 = do
                 _merge
                 a <- importExpression
-                b <- importExpression
+                b <- importExpression <?> "second argument to ❰merge❱"
                 return (Merge a b Nothing)
 
             alternative09 = do
@@ -461,11 +469,27 @@ completeExpression embedded = completeExpression_
 
                 unicode = do
                     _  <- Text.Parser.Char.char 'u';
-                    n0 <- hexNumber
-                    n1 <- hexNumber
-                    n2 <- hexNumber
-                    n3 <- hexNumber
-                    let n = ((n0 * 16 + n1) * 16 + n2) * 16 + n3
+
+                    let toNumber = Data.List.foldl' (\x y -> x * 16 + y) 0
+
+                    let fourCharacterEscapeSequence =
+                            fmap toNumber (Control.Monad.replicateM 4 hexNumber)
+
+                    let bracedEscapeSequence = do
+                            _  <- Text.Parser.Char.char '{'
+                            ns <- some hexNumber
+
+                            let number = toNumber ns
+
+                            Control.Monad.guard (number <= 0x10FFFF)
+                                <|> fail "Invalid Unicode code point"
+
+                            _  <- Text.Parser.Char.char '}'
+
+                            return (toNumber ns)
+
+                    n <- bracedEscapeSequence <|> fourCharacterEscapeSequence
+
                     return (Data.Char.chr n)
 
     doubleQuotedLiteral = do
@@ -693,7 +717,7 @@ http = do
     whitespace
     headers <- optional (do
         _using
-        (importHashed_ <|> (_openParens *> importHashed_ <* _closeParens)) )
+        (completeExpression import_ <|> (_openParens *> completeExpression import_ <* _closeParens)) )
     return (Remote (url { headers }))
 
 missing :: Parser ImportType
@@ -779,8 +803,9 @@ unlinesLiteral chunks =
     Data.Foldable.fold (Data.List.NonEmpty.intersperse "\n" chunks)
 
 emptyLine :: Chunks s a -> Bool
-emptyLine (Chunks [] "") = True
-emptyLine  _             = False
+emptyLine (Chunks [] ""  ) = True
+emptyLine (Chunks [] "\r") = True  -- So that `\r\n` is treated as a blank line
+emptyLine  _               = False
 
 leadingSpaces :: Chunks s a -> Text
 leadingSpaces chunks = Data.Text.takeWhile isSpace firstText

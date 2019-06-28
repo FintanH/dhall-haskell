@@ -51,12 +51,14 @@ module Dhall.Core (
     -- * Pretty-printing
     , pretty
 
+    -- * Optics
+    , subExpressions
+    , chunkExprs
+
     -- * Miscellaneous
     , internalError
     , reservedIdentifiers
     , escapeText
-    , subExpressions
-    , chunkExprs
     , pathCharacter
     , throws
     ) where
@@ -83,6 +85,7 @@ import Data.Text.Prettyprint.Doc (Doc, Pretty)
 import Data.Traversable
 import Dhall.Map (Map)
 import Dhall.Set (Set)
+import Dhall.Src (Src)
 import {-# SOURCE #-} Dhall.Pretty.Internal
 import GHC.Generics (Generic)
 import Numeric.Natural (Natural)
@@ -122,7 +125,8 @@ import qualified Text.Printf
     Note that Dhall does not support functions from terms to types and therefore
     Dhall is not a dependently typed language
 -}
-data Const = Type | Kind | Sort deriving (Show, Eq, Data, Bounded, Enum, Generic)
+data Const = Type | Kind | Sort
+    deriving (Show, Eq, Ord, Data, Bounded, Enum, Generic)
 
 instance Pretty Const where
     pretty = Pretty.unAnnotate . prettyConst
@@ -185,7 +189,7 @@ data URL = URL
     , authority :: Text
     , path      :: File
     , query     :: Maybe Text
-    , headers   :: Maybe ImportHashed
+    , headers   :: Maybe (Expr Src Import)
     } deriving (Eq, Generic, Ord, Show)
 
 instance Pretty URL where
@@ -244,9 +248,9 @@ instance Semigroup ImportType where
     import₀ <> Remote (URL { headers = headers₀, .. }) =
         Remote (URL { headers = headers₁, .. })
       where
-        importHashed₀ = ImportHashed Nothing import₀
+        importHashed₀ = Import (ImportHashed Nothing import₀) Code
 
-        headers₁ = fmap (importHashed₀ <>) headers₀
+        headers₁ = fmap (fmap (importHashed₀ <>)) headers₀
 
     _ <> import₁ =
         import₁
@@ -331,7 +335,7 @@ instance Pretty Import where
     appear as a numeric suffix.
 -}
 data Var = V Text !Integer
-    deriving (Data, Generic, Eq, Show)
+    deriving (Data, Generic, Eq, Ord, Show)
 
 instance IsString Var where
     fromString str = V (fromString str) 0
@@ -439,9 +443,6 @@ data Expr s a
     | ListReverse
     -- | > Optional                                 ~  Optional
     | Optional
-    -- | > OptionalLit t (Just e)                   ~  [e] : Optional t
-    --   > OptionalLit t Nothing                    ~  []  : Optional t
-    | OptionalLit (Expr s a) (Maybe (Expr s a))
     -- | > Some e                                   ~  Some e
     | Some (Expr s a)
     -- | > None                                     ~  None
@@ -469,15 +470,16 @@ data Expr s a
     | Merge (Expr s a) (Expr s a) (Maybe (Expr s a))
     -- | > Field e x                                ~  e.x
     | Field (Expr s a) Text
-    -- | > Project e xs                             ~  e.{ xs }
-    | Project (Expr s a) (Set Text)
+    -- | > Project e (Left xs)                      ~  e.{ xs }
+    -- | > Project e (Right t)                      ~  e.(t)
+    | Project (Expr s a) (Either (Set Text) (Expr s a))
     -- | > Note s x                                 ~  e
     | Note s (Expr s a)
     -- | > ImportAlt                                ~  e1 ? e2
     | ImportAlt (Expr s a) (Expr s a)
     -- | > Embed import                             ~  import
     | Embed a
-    deriving (Eq, Foldable, Generic, Traversable, Show, Data)
+    deriving (Eq, Ord, Foldable, Generic, Traversable, Show, Data)
 
 -- This instance is hand-written due to the fact that deriving
 -- it does not give us an INLINABLE pragma. We annotate this fmap
@@ -531,7 +533,6 @@ instance Functor (Expr s) where
   fmap _ ListIndexed = ListIndexed
   fmap _ ListReverse = ListReverse
   fmap _ Optional = Optional
-  fmap f (OptionalLit e maybeE) = OptionalLit (fmap f e) (fmap (fmap f) maybeE)
   fmap f (Some e) = Some (fmap f e)
   fmap _ None = None
   fmap _ OptionalFold = OptionalFold
@@ -545,7 +546,7 @@ instance Functor (Expr s) where
   fmap f (Prefer e1 e2) = Prefer (fmap f e1) (fmap f e2)
   fmap f (Merge e1 e2 maybeE) = Merge (fmap f e1) (fmap f e2) (fmap (fmap f) maybeE)
   fmap f (Field e1 v) = Field (fmap f e1) v
-  fmap f (Project e1 vs) = Project (fmap f e1) vs
+  fmap f (Project e1 vs) = Project (fmap f e1) (fmap (fmap f) vs)
   fmap f (Note s e1) = Note s (fmap f e1)
   fmap f (ImportAlt e1 e2) = ImportAlt (fmap f e1) (fmap f e2)
   fmap f (Embed a) = Embed (f a)
@@ -608,7 +609,6 @@ instance Monad (Expr s) where
     ListIndexed          >>= _ = ListIndexed
     ListReverse          >>= _ = ListReverse
     Optional             >>= _ = Optional
-    OptionalLit a b      >>= k = OptionalLit (a >>= k) (fmap (>>= k) b)
     Some a               >>= k = Some (a >>= k)
     None                 >>= _ = None
     OptionalFold         >>= _ = OptionalFold
@@ -622,7 +622,7 @@ instance Monad (Expr s) where
     Prefer a b           >>= k = Prefer (a >>= k) (b >>= k)
     Merge a b c          >>= k = Merge (a >>= k) (b >>= k) (fmap (>>= k) c)
     Field a b            >>= k = Field (a >>= k) b
-    Project a b          >>= k = Project (a >>= k) b
+    Project a b          >>= k = Project (a >>= k) (fmap (>>= k) b)
     Note a b             >>= k = Note a (b >>= k)
     ImportAlt a b        >>= k = ImportAlt (a >>= k) (b >>= k)
     Embed a              >>= k = k a
@@ -675,7 +675,6 @@ instance Bifunctor Expr where
     first _  ListIndexed           = ListIndexed
     first _  ListReverse           = ListReverse
     first _  Optional              = Optional
-    first k (OptionalLit a b     ) = OptionalLit (first k a) (fmap (first k) b)
     first k (Some a              ) = Some (first k a)
     first _  None                  = None
     first _  OptionalFold          = OptionalFold
@@ -689,7 +688,7 @@ instance Bifunctor Expr where
     first k (Prefer a b          ) = Prefer (first k a) (first k b)
     first k (Merge a b c         ) = Merge (first k a) (first k b) (fmap (first k) c)
     first k (Field a b           ) = Field (first k a) b
-    first k (Project a b         ) = Project (first k a) b
+    first k (Project a b         ) = Project (first k a) (fmap (first k) b)
     first k (Note a b            ) = Note (k a) (first k b)
     first k (ImportAlt a b       ) = ImportAlt (first k a) (first k b)
     first _ (Embed a             ) = Embed a
@@ -703,7 +702,7 @@ data Binding s a = Binding
     { variable   :: Text
     , annotation :: Maybe (Expr s a)
     , value      :: Expr s a
-    } deriving (Functor, Foldable, Generic, Traversable, Show, Eq, Data)
+    } deriving (Functor, Foldable, Generic, Traversable, Show, Eq, Ord, Data)
 
 instance Bifunctor Binding where
     first k (Binding a b c) = Binding a (fmap (first k) b) (first k c)
@@ -712,7 +711,7 @@ instance Bifunctor Binding where
 
 -- | The body of an interpolated @Text@ literal
 data Chunks s a = Chunks [(Text, Expr s a)] Text
-    deriving (Functor, Foldable, Generic, Traversable, Show, Eq, Data)
+    deriving (Functor, Foldable, Generic, Traversable, Show, Eq, Ord, Data)
 
 instance Data.Semigroup.Semigroup (Chunks s a) where
     Chunks xysL zL <> Chunks         []    zR =
@@ -923,10 +922,6 @@ shift _ _ ListLast = ListLast
 shift _ _ ListIndexed = ListIndexed
 shift _ _ ListReverse = ListReverse
 shift _ _ Optional = Optional
-shift d v (OptionalLit a b) = OptionalLit a' b'
-  where
-    a' =       shift d v  a
-    b' = fmap (shift d v) b
 shift d v (Some a) = Some a'
   where
     a' = shift d v a
@@ -966,9 +961,10 @@ shift d v (Merge a b c) = Merge a' b' c'
 shift d v (Field a b) = Field a' b
   where
     a' = shift d v a
-shift d v (Project a b) = Project a' b
+shift d v (Project a b) = Project a' b'
   where
-    a' = shift d v a
+    a' =       shift d v  a
+    b' = fmap (shift d v) b
 shift d v (Note a b) = Note a b'
   where
     b' = shift d v b
@@ -1101,10 +1097,6 @@ subst _ _ ListLast = ListLast
 subst _ _ ListIndexed = ListIndexed
 subst _ _ ListReverse = ListReverse
 subst _ _ Optional = Optional
-subst x e (OptionalLit a b) = OptionalLit a' b'
-  where
-    a' =       subst x e  a
-    b' = fmap (subst x e) b
 subst x e (Some a) = Some a'
   where
     a' = subst x e a
@@ -1144,9 +1136,10 @@ subst x e (Merge a b c) = Merge a' b' c'
 subst x e (Field a b) = Field a' b
   where
     a' = subst x e a
-subst x e (Project a b) = Project a' b
+subst x e (Project a b) = Project a' b'
   where
-    a' = subst x e a
+    a' =       subst x e  a
+    b' = fmap (subst x e) b
 subst x e (Note a b) = Note a b'
   where
     b' = subst x e b
@@ -1261,7 +1254,6 @@ denote  ListLast              = ListLast
 denote  ListIndexed           = ListIndexed
 denote  ListReverse           = ListReverse
 denote  Optional              = Optional
-denote (OptionalLit a b     ) = OptionalLit (denote a) (fmap denote b)
 denote (Some a              ) = Some (denote a)
 denote  None                  = None
 denote  OptionalFold          = OptionalFold
@@ -1275,7 +1267,7 @@ denote (CombineTypes a b    ) = CombineTypes (denote a) (denote b)
 denote (Prefer a b          ) = Prefer (denote a) (denote b)
 denote (Merge a b c         ) = Merge (denote a) (denote b) (fmap denote c)
 denote (Field a b           ) = Field (denote a) b
-denote (Project a b         ) = Project (denote a) b
+denote (Project a b         ) = Project (denote a) (fmap denote b)
 denote (ImportAlt a b       ) = ImportAlt (denote a) (denote b)
 denote (Embed a             ) = Embed a
 
@@ -1575,8 +1567,6 @@ normalizeWithM ctx e0 = loop (denote e0)
     ListIndexed -> pure ListIndexed
     ListReverse -> pure ListReverse
     Optional -> pure Optional
-    OptionalLit _A Nothing -> loop (App None _A)
-    OptionalLit _ (Just a) -> loop (Some a)
     Some a -> Some <$> a'
       where
         a' = loop a
@@ -1664,7 +1654,7 @@ normalizeWithM ctx e0 = loop (denote e0)
                     Just v  -> loop v
                     Nothing -> Field <$> (RecordLit <$> traverse loop kvs) <*> pure x
             _ -> pure (Field r' x)
-    Project r xs     -> do
+    Project r (Left xs)-> do
         r' <- loop r
         case r' of
             RecordLit kvs ->
@@ -1674,13 +1664,22 @@ normalizeWithM ctx e0 = loop (denote e0)
                       where
                         kvs' = Dhall.Map.fromList s
                     Nothing ->
-                        Project <$> (RecordLit <$> traverse loop kvs) <*> pure xs
+                        Project <$> (RecordLit <$> traverse loop kvs) <*> pure (Left xs)
               where
                 adapt x = do
                     v <- Dhall.Map.lookup x kvs
                     return (x, v)
             _   | null xs -> pure (RecordLit mempty)
-                | otherwise -> pure (Project r' xs)
+                | otherwise -> pure (Project r' (Left xs))
+    Project r (Right e1) -> do
+        e2 <- loop e1
+
+        case e2 of
+            Record kts -> do
+                loop (Project r (Left (Dhall.Set.fromList (Dhall.Map.keys kts))))
+            _ -> do
+                r' <- loop r
+                pure (Project r' (Right e2))
     Note _ e' -> loop e'
     ImportAlt l _r -> loop l
     Embed a -> pure (Embed a)
@@ -1855,7 +1854,6 @@ isNormalized e0 = loop (denote e0)
       ListIndexed -> True
       ListReverse -> True
       Optional -> True
-      OptionalLit _ _ -> False
       Some a -> loop a
       None -> True
       OptionalFold -> True
@@ -1906,9 +1904,14 @@ isNormalized e0 = loop (denote e0)
       Project r xs -> loop r &&
           case r of
               RecordLit kvs ->
-                  if all (flip Dhall.Map.member kvs) xs
-                      then False
-                      else True
+                  case xs of
+                      Left  s -> not (all (flip Dhall.Map.member kvs) s)
+                      Right e' ->
+                          case e' of
+                              Record kts ->
+                                  loop (Project r (Left (Dhall.Set.fromList (Dhall.Map.keys kts))))
+                              _ ->
+                                  False
               _ -> not (null xs)
       Note _ e' -> loop e'
       ImportAlt l _r -> loop l
@@ -1924,8 +1927,9 @@ False
 False
 -}
 freeIn :: Eq a => Var -> Expr s a -> Bool
-variable `freeIn` expression =
-    Dhall.Core.shift 1 variable strippedExpression /= strippedExpression
+variable@(V var i) `freeIn` expression =
+    Dhall.Core.subst variable (Var (V var (i + 1))) strippedExpression
+      /= strippedExpression
   where
     denote' :: Expr t b -> Expr () b
     denote' = denote
@@ -2060,7 +2064,6 @@ subExpressions _ ListLast = pure ListLast
 subExpressions _ ListIndexed = pure ListIndexed
 subExpressions _ ListReverse = pure ListReverse
 subExpressions _ Optional = pure Optional
-subExpressions f (OptionalLit a b) = OptionalLit <$> f a <*> traverse f b
 subExpressions f (Some a) = Some <$> f a
 subExpressions _ None = pure None
 subExpressions _ OptionalFold = pure OptionalFold
@@ -2075,7 +2078,7 @@ subExpressions f (CombineTypes a b) = CombineTypes <$> f a <*> f b
 subExpressions f (Prefer a b) = Prefer <$> f a <*> f b
 subExpressions f (Merge a b t) = Merge <$> f a <*> f b <*> traverse f t
 subExpressions f (Field a b) = Field <$> f a <*> pure b
-subExpressions f (Project a b) = Project <$> f a <*> pure b
+subExpressions f (Project a b) = Project <$> f a <*> traverse f b
 subExpressions f (Note a b) = Note a <$> f b
 subExpressions f (ImportAlt l r) = ImportAlt <$> f l <*> f r
 subExpressions _ (Embed a) = pure (Embed a)
